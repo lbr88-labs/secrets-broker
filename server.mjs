@@ -35,7 +35,20 @@ const MOCK = process.env.SECRETS_BROKER_MOCK === '1'
 const DEFAULT_BW_JS = process.env.SECRETS_BROKER_BW ?? 'bw'
 const BW_JS = process.env.SECRETS_BROKER_BW ?? DEFAULT_BW_JS
 
-fs.mkdirSync(ROOT, { recursive: true })
+fs.mkdirSync(ROOT, { recursive: true, mode: 0o700 })
+try {
+  fs.chmodSync(ROOT, 0o700)
+} catch {}
+
+function ensureMode(file, mode) {
+  try {
+    if (fs.existsSync(file)) fs.chmodSync(file, mode)
+  } catch {}
+}
+function writePrivate(file, data) {
+  fs.writeFileSync(file, data, { encoding: 'utf8', mode: 0o600 })
+  ensureMode(file, 0o600)
+}
 
 function randomToken() {
   return crypto.randomBytes(24).toString('base64url')
@@ -57,8 +70,14 @@ function loadEncryptionKey() {
     return encryptionKey
   }
   encryptionKey = crypto.randomBytes(32)
-  fs.writeFileSync(ENCRYPTION_KEY_PATH, `${encryptionKey.toString('base64')}\n`, { mode: 0o600 })
+  writePrivate(ENCRYPTION_KEY_PATH, `${encryptionKey.toString('base64')}\n`)
   return encryptionKey
+}
+function keyMaterialOutsideDataDir() {
+  if (process.env.SECRETS_BROKER_ENCRYPTION_KEY) return true
+  const keyPath = path.resolve(ENCRYPTION_KEY_PATH)
+  const root = path.resolve(ROOT)
+  return keyPath !== root && !keyPath.startsWith(`${root}${path.sep}`)
 }
 function isEncrypted(value) {
   return typeof value === 'string' && value.startsWith('enc:v1:')
@@ -112,12 +131,28 @@ function saveAgentTokens(tokens) {
   for (const [name, value] of Object.entries(tokens)) {
     encrypted[name] = isEncrypted(value) ? value : encryptString(value)
   }
-  fs.writeFileSync(AGENT_TOKENS_PATH, JSON.stringify(encrypted, null, 2), { mode: 0o600 })
+  writePrivate(AGENT_TOKENS_PATH, JSON.stringify(encrypted, null, 2))
+}
+function isOauthPlaceholder(value) {
+  return value === 'oauth' || value === hashToken('oauth')
 }
 function migrateAgentTokens() {
   const tokens = loadAgentTokens()
   let changed = false
   for (const [name, value] of Object.entries(config.agents ?? {})) {
+    // OAuth agents are not bearer-token accounts. A stored 'oauth' placeholder,
+    // or the hash migration made of that placeholder, must never authenticate.
+    if (name.startsWith('oauth:') || isOauthPlaceholder(value)) {
+      if (config.agents[name] !== null) {
+        config.agents[name] = null
+        changed = true
+      }
+      if (Object.prototype.hasOwnProperty.call(tokens, name)) {
+        delete tokens[name]
+        changed = true
+      }
+      continue
+    }
     if (typeof value === 'string' && !value.startsWith('sha256:') && value.length > 0) {
       tokens[name] = value
       config.agents[name] = hashToken(value)
@@ -136,6 +171,10 @@ function readAutoUnlockPassword() {
   const fromEnv = process.env.SECRETS_BROKER_MASTER_PASSWORD
   if (fromEnv) return fromEnv
   if (!fs.existsSync(MASTER_PASSWORD_FILE)) return undefined
+  if (!keyMaterialOutsideDataDir()) {
+    console.error('[secrets-broker] refusing on-disk auto-unlock because the encryption key is stored in the data directory. Set SECRETS_BROKER_ENCRYPTION_KEY or SECRETS_BROKER_KEY_FILE (a Docker secret or a path outside the data volume), or unlock manually.')
+    return undefined
+  }
   const raw = fs.readFileSync(MASTER_PASSWORD_FILE, 'utf8').trim()
   if (raw.length === 0) return undefined
   if (isEncrypted(raw)) {
@@ -145,34 +184,38 @@ function readAutoUnlockPassword() {
       return undefined
     }
   }
-  try {
-    fs.writeFileSync(MASTER_PASSWORD_FILE, `${encryptString(raw)}\n`, { mode: 0o600 })
+    try {
+    writePrivate(MASTER_PASSWORD_FILE, `${encryptString(raw)}\n`)
   } catch {}
   return raw
 }
 
-function loginThrottle(req) {
-  const ip = req.socket?.remoteAddress ?? 'unknown'
-  const entry = loginFailures.get(ip)
-  if (entry === undefined) return { ip, blocked: false, count: 0 }
-  if (entry.blockedUntil && entry.blockedUntil > Date.now()) return { ip, blocked: true, count: entry.count }
-  if (entry.firstAt < Date.now() - 10 * 60 * 1000) {
-    loginFailures.delete(ip)
-    return { ip, blocked: false, count: 0 }
-  }
-  return { ip, blocked: false, count: entry.count }
+function clientIp(req) {
+  return req.socket?.remoteAddress ?? 'unknown'
 }
-function recordLoginFailure(ip) {
-  const entry = loginFailures.get(ip) ?? { count: 0, firstAt: Date.now(), blockedUntil: 0 }
+function loginThrottle(req, bucket) {
+  const ip = clientIp(req)
+  const key = `${bucket}:${ip}`
+  const entry = loginFailures.get(key)
+  if (entry === undefined) return { ip, key, blocked: false, count: 0 }
+  if (entry.blockedUntil && entry.blockedUntil > Date.now()) return { ip, key, blocked: true, count: entry.count }
+  if (entry.firstAt < Date.now() - 10 * 60 * 1000) {
+    loginFailures.delete(key)
+    return { ip, key, blocked: false, count: 0 }
+  }
+  return { ip, key, blocked: false, count: entry.count }
+}
+function recordLoginFailure(key) {
+  const entry = loginFailures.get(key) ?? { count: 0, firstAt: Date.now(), blockedUntil: 0 }
   entry.count += 1
   if (entry.count >= 5) entry.blockedUntil = Date.now() + 5 * 60 * 1000
-  loginFailures.set(ip, entry)
+  loginFailures.set(key, entry)
 }
 
 function loadConfig() {
   if (fs.existsSync(CONFIG_PATH)) {
     const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
-    parsed.agents ??= { dsh: randomToken(), codex: randomToken(), hermes: randomToken() }
+    parsed.agents ??= {}
     parsed.agentAccess ??= {}
     parsed.agentWrite ??= {}
     parsed.itemGroups ??= {}
@@ -186,7 +229,7 @@ function loadConfig() {
     parsed.agentAliases ??= {}
     parsed.port ??= 8788
     parsed.bwJs ??= BW_JS
-    parsed.autoImport ??= true
+    parsed.autoImport ??= false
     if (parsed.oidc?.clientSecret && isEncrypted(parsed.oidc.clientSecret)) {
       parsed.oidc.clientSecret = decryptString(parsed.oidc.clientSecret)
     }
@@ -199,16 +242,23 @@ function loadConfig() {
     if (parsed.wxpush?.token && isEncrypted(parsed.wxpush.token)) {
       parsed.wxpush.token = decryptString(parsed.wxpush.token)
     }
+    if (parsed.ntfyToken && isEncrypted(parsed.ntfyToken)) parsed.ntfyToken = decryptString(parsed.ntfyToken)
+    if (parsed.profile?.totpSecret && isEncrypted(parsed.profile.totpSecret)) parsed.profile.totpSecret = decryptString(parsed.profile.totpSecret)
+    if (parsed.profile?.totpPending && isEncrypted(parsed.profile.totpPending)) parsed.profile.totpPending = decryptString(parsed.profile.totpPending)
+    parsed.oauthEnabled = parsed.oauthEnabled === true
+    parsed.oauthAllowRegistration = parsed.oauthAllowRegistration === true
     return parsed
   }
   const config = {
     port: Number(process.env.SECRETS_BROKER_PORT ?? 8788),
     serverUrl: 'https://vault.example.com',
     bwJs: BW_JS,
-    autoImport: true,
-    agents: { dsh: randomToken(), codex: randomToken(), hermes: randomToken() },
+    autoImport: false,
+    agents: {},
+    oauthEnabled: false,
+    oauthAllowRegistration: false,
   }
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8')
+  writePrivate(CONFIG_PATH, JSON.stringify(config, null, 2))
   return config
 }
 
@@ -226,7 +276,14 @@ function saveConfig() {
   if (serializable.wxpush?.token && !isEncrypted(serializable.wxpush.token)) {
     serializable.wxpush.token = encryptString(serializable.wxpush.token)
   }
-  fs.writeFileSync(CONFIG_PATH, JSON.stringify(serializable, null, 2), 'utf8')
+  if (serializable.ntfyToken && !isEncrypted(serializable.ntfyToken)) serializable.ntfyToken = encryptString(serializable.ntfyToken)
+  if (serializable.profile?.totpSecret && !isEncrypted(serializable.profile.totpSecret)) {
+    serializable.profile.totpSecret = encryptString(serializable.profile.totpSecret)
+  }
+  if (serializable.profile?.totpPending && !isEncrypted(serializable.profile.totpPending)) {
+    serializable.profile.totpPending = encryptString(serializable.profile.totpPending)
+  }
+  writePrivate(CONFIG_PATH, JSON.stringify(serializable, null, 2))
 }
 
 function loadGrants() {
@@ -246,23 +303,31 @@ function loadGrants() {
 }
 
 function saveGrants() {
-  fs.writeFileSync(GRANTS_PATH, JSON.stringify({ grants }, null, 2), 'utf8')
+  writePrivate(GRANTS_PATH, JSON.stringify({ grants }, null, 2))
 }
 
 function audit(entry) {
-  fs.appendFileSync(AUDIT_PATH, `${JSON.stringify({ time: new Date().toISOString(), ...entry })}\n`, 'utf8')
+  fs.appendFileSync(AUDIT_PATH, `${JSON.stringify({ time: new Date().toISOString(), ...entry })}\n`, { encoding: 'utf8', mode: 0o600 })
+  ensureMode(AUDIT_PATH, 0o600)
 }
 
 const config = loadConfig()
 if (process.env.SECRETS_BROKER_PORT) config.port = Number(process.env.SECRETS_BROKER_PORT)
 migrateAgentTokens()
 if (config.oidc?.clientSecret && !isEncrypted(config.oidc.clientSecret)) saveConfig()
+for (const file of [CONFIG_PATH, GRANTS_PATH, AUDIT_PATH, AGENT_TOKENS_PATH, MASTER_PASSWORD_FILE, ENCRYPTION_KEY_PATH]) {
+  ensureMode(file, 0o600)
+}
 const ADMIN_PASSWORD = process.env.SECRETS_BROKER_ADMIN_PASSWORD ?? config.adminPassword ?? ''
 const BIND = process.env.SECRETS_BROKER_BIND ?? config.bind ?? '127.0.0.1'
 const SESSION_SECRET = config.adminSessionSecret ?? crypto.randomBytes(32).toString('hex')
 const AUTH_REQUIRED = ADMIN_PASSWORD.length > 0
+const parsedSessionTtl = Number(process.env.SECRETS_BROKER_ADMIN_SESSION_TTL_MS ?? 12 * 60 * 60 * 1000)
+const ADMIN_SESSION_TTL_MS = Number.isFinite(parsedSessionTtl) && parsedSessionTtl > 0 ? parsedSessionTtl : 12 * 60 * 60 * 1000
+const adminSessions = new Map()
 let PUBLIC_URL = (config.publicUrl ?? process.env.BROKER_PUBLIC_URL ?? 'http://127.0.0.1:8788').replace(/\/+$/, '')
 let NTFY_URL = config.ntfyUrl ?? process.env.NTFY_URL ?? ''
+let NTFY_TOKEN = config.ntfyToken ?? process.env.NTFY_TOKEN ?? ''
 let OIDC_ISSUER = (config.oidc?.issuer ?? process.env.OIDC_ISSUER ?? '').replace(/\/+$/, '')
 let OIDC_CLIENT_ID = config.oidc?.clientId ?? process.env.OIDC_CLIENT_ID ?? ''
 let OIDC_CLIENT_SECRET = config.oidc?.clientSecret ?? process.env.OIDC_CLIENT_SECRET ?? ''
@@ -272,6 +337,7 @@ let OIDC_ENABLED = OIDC_ISSUER.length > 0 && OIDC_CLIENT_ID.length > 0
 function refreshRuntimeSettings() {
   PUBLIC_URL = (config.publicUrl ?? process.env.BROKER_PUBLIC_URL ?? 'http://127.0.0.1:8788').replace(/\/+$/, '')
   NTFY_URL = config.ntfyUrl ?? process.env.NTFY_URL ?? ''
+  NTFY_TOKEN = config.ntfyToken ?? process.env.NTFY_TOKEN ?? ''
   OIDC_ISSUER = (config.oidc?.issuer ?? process.env.OIDC_ISSUER ?? '').replace(/\/+$/, '')
   OIDC_CLIENT_ID = config.oidc?.clientId ?? process.env.OIDC_CLIENT_ID ?? ''
   OIDC_CLIENT_SECRET = config.oidc?.clientSecret ?? process.env.OIDC_CLIENT_SECRET ?? ''
@@ -626,7 +692,11 @@ function restoreGrant(agent, name) {
   if (grant === undefined) return undefined
   grant.revokedAt = null
   if (grant.expiresAt !== null && grant.expiresAt !== undefined && grant.expiresAt <= Date.now()) {
-    grant.expiresAt = null
+    // Leave an expired grant expired. Set a new expiry explicitly; do not promote it to forever.
+    grant.reads = 0
+    saveGrants()
+    audit({ event: 'grant.restore', agent, name, expired: true })
+    return grant
   }
   grant.reads = 0
   saveGrants()
@@ -684,8 +754,47 @@ function esc(value) {
   return String(value ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c])
 }
 
-function adminCookieValue() {
-  return crypto.createHmac('sha256', SESSION_SECRET).update('admin-session').digest('base64url')
+function passwordMatches(presented) {
+  if (ADMIN_PASSWORD.length === 0) return false
+  const expected = crypto.createHash('sha256').update(ADMIN_PASSWORD).digest()
+  const actual = crypto.createHash('sha256').update(String(presented ?? '')).digest()
+  return crypto.timingSafeEqual(expected, actual)
+}
+
+function safeEqualString(left, right) {
+  const a = crypto.createHash('sha256').update(String(left ?? '')).digest()
+  const b = crypto.createHash('sha256').update(String(right ?? '')).digest()
+  return crypto.timingSafeEqual(a, b)
+}
+
+function cookieSecure(req) {
+  const flag = String(process.env.SECRETS_BROKER_COOKIE_SECURE ?? '').toLowerCase()
+  if (flag === '0' || flag === 'false') return false
+  if (flag === '1' || flag === 'true') return true
+  if (PUBLIC_URL.startsWith('https://')) return true
+  const proto = String(req?.headers?.['x-forwarded-proto'] ?? '').split(',')[0].trim().toLowerCase()
+  return proto === 'https' || Boolean(req?.socket?.encrypted)
+}
+
+function adminCookie(id, req) {
+  const secure = cookieSecure(req) ? '; Secure' : ''
+  return `broker_admin=${id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${Math.floor(ADMIN_SESSION_TTL_MS / 1000)}${secure}`
+}
+
+function clearAdminCookie(req) {
+  const secure = cookieSecure(req) ? '; Secure' : ''
+  return `broker_admin=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure}`
+}
+
+function createAdminSession() {
+  const id = crypto.randomBytes(32).toString('base64url')
+  adminSessions.set(id, { expiresAt: Date.now() + ADMIN_SESSION_TTL_MS })
+  return id
+}
+
+function destroyAdminSession(req) {
+  const value = cookies(req).broker_admin
+  if (value) adminSessions.delete(value)
 }
 
 function cookies(req) {
@@ -698,9 +807,38 @@ function cookies(req) {
 }
 
 function isAdmin(req) {
-  if (!AUTH_REQUIRED) return true
   const value = cookies(req).broker_admin
-  return typeof value === 'string' && value === adminCookieValue()
+  if (typeof value !== 'string' || value.length === 0) return false
+  const session = adminSessions.get(value)
+  if (!session) return false
+  if (session.expiresAt <= Date.now()) {
+    adminSessions.delete(value)
+    return false
+  }
+  return true
+}
+
+function isLoopbackHost(value) {
+  const host = String(value ?? '').trim().replace(/^\[|\]$/g, '').toLowerCase()
+  return host === '127.0.0.1' || host === '::1' || host === 'localhost'
+}
+
+function behindProxy() {
+  const flag = String(process.env.SECRETS_BROKER_BEHIND_PROXY ?? '').toLowerCase()
+  if (flag === '1' || flag === 'true' || flag === 'yes') return true
+  if (config.behindProxy === true) return true
+  try {
+    return !isLoopbackHost(new URL(PUBLIC_URL).hostname)
+  } catch {
+    return false
+  }
+}
+
+function assertSafeBind() {
+  const loopback = isLoopbackHost(String(BIND).split('%')[0])
+  if (AUTH_REQUIRED || (loopback && !behindProxy())) return
+  console.error('[secrets-broker] refusing to start: an admin password is required when listening on a non-loopback address or behind a proxy. Set SECRETS_BROKER_ADMIN_PASSWORD. If a tunnel reaches this process on localhost, set SECRETS_BROKER_BEHIND_PROXY=1 as well.')
+  process.exit(1)
 }
 
 function loginPage(message) {
@@ -767,7 +905,8 @@ async function verifyIdToken(idToken, expectedNonce) {
   const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'))
   if (header.alg !== 'ES256') throw new Error(`unsupported id_token alg ${header.alg}`)
   const jwks = await (await fetch(discovery.jwks_uri)).json()
-  const jwk = (jwks.keys ?? []).find((key) => key.kid === header.kid) ?? (jwks.keys ?? [])[0]
+  const keys = jwks.keys ?? []
+  const jwk = header.kid ? keys.find((key) => key.kid === header.kid) : keys.length === 1 ? keys[0] : undefined
   if (jwk === undefined) throw new Error('no JWKS key for id_token')
   const key = crypto.createPublicKey({ key: jwk, format: 'jwk' })
   const valid = crypto.verify(
@@ -778,7 +917,7 @@ async function verifyIdToken(idToken, expectedNonce) {
   )
   if (!valid) throw new Error('id_token signature invalid')
   const now = Math.floor(Date.now() / 1000)
-  if (typeof payload.exp === 'number' && payload.exp < now) throw new Error('id_token expired')
+  if (typeof payload.exp !== 'number' || payload.exp < now) throw new Error('id_token expired')
   if (payload.aud !== OIDC_CLIENT_ID && !(Array.isArray(payload.aud) && payload.aud.includes(OIDC_CLIENT_ID))) {
     throw new Error('id_token audience mismatch')
   }
@@ -875,7 +1014,7 @@ function renderItems(){var box=$('items-box');var q=($('item-search').value||'')
   box.innerHTML='<table><tr><th>名称</th><th>网址</th><th>分组</th><th>类型</th><th>操作</th></tr>'+items.map(function(i){return '<tr><td><code>'+esc(i.name)+'</code>'+(i.noApproval?' <span class="pill">免审批</span>':'')+'</td><td class="hint">'+esc(i.url||'')+'</td><td class="hint">'+esc(i.group||'')+'</td><td>'+esc(i.type)+'</td><td><button data-act="share" data-name="'+esc(i.name)+'">分享</button><button data-act="edit-item" data-name="'+esc(i.name)+'">编辑</button><button class="danger" data-act="item-delete" data-name="'+esc(i.name)+'">删除</button></td></tr>'}).join('')+'</table>';
   var gsel=$('group-filter');if(gsel){var current=gsel.value;var groups=Array.from(new Set(state.items.map(function(i){return i.group||''}))).filter(Boolean).sort();gsel.innerHTML='<option value="">全部分组</option>'+groups.map(function(g){return '<option value="'+esc(g)+'">'+esc(g)+'</option>'}).join('');gsel.value=current}}
 function renderAgents(){var box=$('agents-box');if(!state.agents.length){box.innerHTML='<div class="empty">暂无 agent</div>';return}
-  box.innerHTML='<table><tr><th>Agent</th><th>Token</th><th>可读条目</th><th>操作</th></tr>'+state.agents.map(function(a){var allow=a.allow&&a.allow.length?a.allow.join(', '):'全部';var label=a.alias||a.name;var tokenCell=a.oauth?'<code>OAuth 2.1</code>':'<code>'+esc(a.tokenPreview||'')+'</code> <button data-act="copy" data-agent="'+esc(a.name)+'">复制</button>';var ops='<button data-act="agent-alias" data-agent="'+esc(a.name)+'">改名</button>';if(!a.oauth){ops+='<button data-act="access" data-agent="'+esc(a.name)+'">设置可读</button><button data-act="agent-write" data-agent="'+esc(a.name)+'" data-allow="'+((state.agentWrite&&state.agentWrite[a.name])?'0':'1')+'">写入:'+((state.agentWrite&&state.agentWrite[a.name])?'开':'关')+'</button><button data-act="rotate" data-agent="'+esc(a.name)+'">轮换</button><button class="danger" data-act="agent-delete" data-agent="'+esc(a.name)+'">删除</button>'}return '<tr><td><b>'+esc(label)+'</b>'+(a.alias?'<br><span class="hint">'+esc(a.name)+'</span>':'')+'</td><td>'+tokenCell+'</td><td class="hint">'+esc(allow)+'</td><td>'+ops+'</td></tr>'}).join('')+'</table>'}
+  box.innerHTML='<table><tr><th>Agent</th><th>Token</th><th>可读条目</th><th>操作</th></tr>'+state.agents.map(function(a){var allow=a.allow&&a.allow.length?a.allow.join(', '):'无';var label=a.alias||a.name;var tokenCell=a.oauth?'<code>OAuth 2.1</code>':'<code>'+esc(a.tokenPreview||'')+'</code> <button data-act="copy" data-agent="'+esc(a.name)+'">复制</button>';var ops='<button data-act="agent-alias" data-agent="'+esc(a.name)+'">改名</button>';ops+='<button data-act="access" data-agent="'+esc(a.name)+'">设置可读</button><button data-act="agent-write" data-agent="'+esc(a.name)+'" data-allow="'+((state.agentWrite&&state.agentWrite[a.name])?'0':'1')+'">写入:'+((state.agentWrite&&state.agentWrite[a.name])?'开':'关')+'</button>';if(!a.oauth){ops+='<button data-act="rotate" data-agent="'+esc(a.name)+'">轮换</button>'}ops+='<button class="danger" data-act="agent-delete" data-agent="'+esc(a.name)+'">删除</button>';return '<tr><td><b>'+esc(label)+'</b>'+(a.alias?'<br><span class="hint">'+esc(a.name)+'</span>':'')+'</td><td>'+tokenCell+'</td><td class="hint">'+esc(allow)+'</td><td>'+ops+'</td></tr>'}).join('')+'</table>'}
 function renderGrants(){var box=$('grants-box');var rows=state.grants;if(!rows.length){box.innerHTML='<div class="empty">暂无授权</div>';return}
   var sort=$('g-sort').value,group=$('g-group').value;var list=rows.slice();var key=sort==='created'?function(g){return g.createdAt?Date.parse(g.createdAt):0}:sort==='agent'?function(g){return String(g.agent).toLowerCase()}:sort==='name'?function(g){return String(g.name).toLowerCase()}:function(g){return g.expiresAt==null?Number.MAX_SAFE_INTEGER:g.expiresAt};
   list.sort(function(x,y){var a=key(x),b=key(y);return a<b?-1:a>b?1:0});
@@ -887,10 +1026,10 @@ function renderGrants(){var box=$('grants-box');var rows=state.grants;if(!rows.l
   box.innerHTML=head+list.map(row).join('')+'</table>'}
 function openShare(name){state.shareItem=name;var agents=state.agents.map(function(a){return '<label class="chk"><input type="checkbox" class="share-agent" value="'+esc(a.name)+'">'+esc(a.name)+'</label>'}).join('');openModal('分享「'+name+'」','<div>'+agents+'</div><div class="row" style="margin-top:10px"><label class="hint">有效时间 <select id="share-ttl"><option value="1">1 小时</option><option value="24">24 小时</option><option value="168">7 天</option><option value="0">永久</option></select></label><label class="hint">可读次数 <input id="share-reads" type="number" min="1" placeholder="不限" style="width:90px"></label><button class="primary" data-act="share-go">分享</button></div>')}
 function openAccess(agent){var a=state.agents.find(function(x){return x.name===agent});if(!a)return;if(!state.items.length){toast('解锁并加载条目后再设置',true);return}
-  var all=(a.allow||[]).length===0;var boxes=state.items.map(function(i){var checked=all||(a.allow||[]).indexOf(i.name)>=0;return '<label class="chk"><input type="checkbox" class="access-item" value="'+esc(i.name)+'"'+(checked?' checked':'')+'>'+esc(i.name)+'</label>'}).join('');
+  var all=(a.allow||[]).indexOf('*')>=0;var boxes=state.items.map(function(i){var checked=all||(a.allow||[]).indexOf(i.name)>=0;return '<label class="chk"><input type="checkbox" class="access-item" value="'+esc(i.name)+'"'+(checked?' checked':'')+'>'+esc(i.name)+'</label>'}).join('');
   openModal('「'+agent+'」可读条目','<label class="chk"><input type="checkbox" id="access-all"'+(all?' checked':'')+'> 全部条目</label><div>'+boxes+'</div><div class="row"><button class="primary" data-act="access-save" data-agent="'+esc(agent)+'">保存</button></div>')}
 async function doShare(){var agents=[].slice.call(document.querySelectorAll('.share-agent:checked')).map(function(x){return x.value});if(!agents.length){toast('至少选一个 agent',true);return}var ttl=Number($('share-ttl').value);var reads=Number($('share-reads').value||0);for(var i=0;i<agents.length;i++){await post('/api/grants/create',{agent:agents[i],name:state.shareItem,ttlHours:ttl,maxReads:reads})}toast('已分享给 '+agents.join(', '));closeModal();loadAll()}
-async function doAccess(agent){var all=$('access-all').checked;var names=all?'':[].slice.call(document.querySelectorAll('.access-item:checked')).map(function(x){return x.value}).join(',');await post('/api/agents/access',{name:agent,allow:names});toast('已保存');closeModal();loadAll()}
+async function doAccess(agent){var all=$('access-all').checked;var names=all?'*':[].slice.call(document.querySelectorAll('.access-item:checked')).map(function(x){return x.value}).join(',');await post('/api/agents/access',{name:agent,allow:names});toast('已保存');closeModal();loadAll()}
 document.addEventListener('submit',async function(e){var f=e.target;try{
   if(f.id==='unlock-form'){e.preventDefault();toast('解锁中…');var r=await post('/api/unlock',{password:f.password.value});f.password.value='';toast(r.ok?'已解锁':'解锁失败');await loadAll()}
   else if(f.id==='item-form'){e.preventDefault();var d=new FormData(f);var body={name:d.get('name'),value:d.get('value')||'',notes:d.get('notes')||''};await post('/api/items/save',body);f.reset();toast('已保存');await loadAll()}
@@ -1058,10 +1197,11 @@ tbody tr:hover td{background:var(--hover)}
 </form>
 <div class="hint">OIDC 通过标准 Discovery 自动发现端点；xid/Keycloak/Authentik/Auth0 等都可。</div></div>
 <div class="card"><h2>通知</h2>
-<label class="hint">ntfy URL（如 https://ntfy.example.com/topic 或 http://172.17.0.1:2586/topic）<br><input id="ntfy-input" style="width:100%"></label>
+<label class="hint">ntfy URL（私有主题，如 https://ntfy.example.com/secrets-topic）<br><input id="ntfy-input" style="width:100%"></label>
+<label class="hint">ntfy access token（留空不修改）<br><input id="ntfy-token" type="password" style="width:100%" autocomplete="off"></label>
 <div class="row"><button data-act="settings-save">保存设置</button><button data-act="ntfy-test">发送测试通知</button></div>
 <div class="hint" id="notify-info"></div></div>
-<div class="card"><h2>Telegram 通知</h2><label class="hint">Bot Token<br><input name="telegramToken" type="password" style="width:100%"></label><label class="hint">Chat ID<br><input name="telegramChatId" style="width:100%"></label><div class="row"><button data-act="settings-save">保存设置</button></div><div class="hint" id="telegram-info"></div></div>
+<div class="card"><h2>Telegram 通知</h2><label class="hint">Bot Token<br><input name="telegramToken" type="password" style="width:100%"></label><label class="hint">Chat ID<br><input name="telegramChatId" style="width:100%"></label><label class="hint">User ID（回调必须来自这个 Telegram 用户；不会从消息里自动改）<br><input name="telegramUserId" style="width:100%"></label><div class="row"><button data-act="settings-save">保存设置</button></div><div class="hint" id="telegram-info"></div></div>
 <div class="card"><h2>Gotify 通知</h2><label class="hint">Gotify URL<br><input name="gotifyUrl" placeholder="https://gotify.example.com" style="width:100%"></label><label class="hint">App Token<br><input name="gotifyToken" type="password" style="width:100%"></label><div class="row"><button data-act="settings-save">保存设置</button></div><div class="hint" id="gotify-info"></div></div>
 <div class="card"><h2>wxpush 微信通知</h2><label class="hint">wxpush URL<br><input name="wxpushUrl" placeholder="https://wxpush.example.com" style="width:100%"></label><label class="hint">API Token<br><input name="wxpushToken" type="password" style="width:100%"></label><div class="row"><button data-act="settings-save">保存设置</button></div><div class="hint" id="wxpush-info"></div></div>
 <div class="card"><h2>服务与安全</h2><div class="hint" id="settings-info"></div><div class="hint" id="security-info"></div>
@@ -1174,8 +1314,8 @@ function renderHeaderUser(){var p=state.profile||{};var el=$('header-user');if(!
 function settingsField(name){var el=document.querySelector('[name="'+name+'"]');return el?el.value:''}
 async function loadProfile(){try{var p=await api('/api/profile');state.profile=p;var f=$('profile-form');if(f){f.name.value=p.name||'';f.email.value=p.email||'';f.phone.value=p.phone||'';f.avatarUrl.value=p.avatarUrl||''}var ti=$('totp-info');if(ti)ti.innerHTML=p.totpEnabled?'已启用 TOTP 两步验证':'未启用';var bi=$('oidc-bind-info');if(bi)bi.innerHTML=p.oidcEnabled?(p.oidcBound?'已绑定 <code>'+esc(p.oidcIssuer||'OIDC')+'</code> · 外部标识 <code>'+esc(p.oidcSubMasked||'')+'</code>'+(p.oidcEmail?' · '+esc(p.oidcEmail):''):'未绑定。配置好 OIDC 后，点“绑定 OIDC 账号”完成关联。'):'未配置 OIDC（Settings → OIDC）';var bl=$('oidc-bind-link');if(bl)bl.style.display=p.oidcEnabled?'inline-block':'none';renderHeaderUser()}catch(e){}}
 async function saveProfile(){var f=$('profile-form');try{await post('/api/profile',{name:f.name.value,email:f.email.value,phone:f.phone.value,avatarUrl:f.avatarUrl.value});toast('资料已保存');loadProfile()}catch(e){toast(e.message,true)}}
-async function loadSettings(){try{var s=await api('/api/settings');state.agentWrite=s.agentWrite||{};document.querySelectorAll('[name="publicUrl"]').forEach(function(el){el.value=s.publicUrl||''});document.querySelectorAll('[name="serverUrl"]').forEach(function(el){el.value=s.serverUrl||''});document.querySelectorAll('[name="oidcIssuer"]').forEach(function(el){el.value=s.oidc.issuer||''});document.querySelectorAll('[name="oidcClientId"]').forEach(function(el){el.value=s.oidc.clientId||''});document.querySelectorAll('[name="oidcRedirectUri"]').forEach(function(el){el.value=s.oidc.redirectUri||''});document.querySelectorAll('[name="oidcAuthorizationEndpoint"]').forEach(function(el){el.value=s.oidc.authorizationEndpoint||''});document.querySelectorAll('[name="oidcTokenEndpoint"]').forEach(function(el){el.value=s.oidc.tokenEndpoint||''});document.querySelectorAll('[name="oidcUserinfoEndpoint"]').forEach(function(el){el.value=s.oidc.userinfoEndpoint||''});document.querySelectorAll('[name="oidcJwksUri"]').forEach(function(el){el.value=s.oidc.jwksUri||''});document.querySelectorAll('[name="oidcScope"]').forEach(function(el){el.value=s.oidc.scope||''});document.querySelectorAll('[name="oidcClaimIdentifier"]').forEach(function(el){el.value=(s.oidc.claims&&s.oidc.claims.identifier)||''});document.querySelectorAll('[name="oidcClaimName"]').forEach(function(el){el.value=(s.oidc.claims&&s.oidc.claims.name)||''});document.querySelectorAll('[name="oidcClaimEmail"]').forEach(function(el){el.value=(s.oidc.claims&&s.oidc.claims.email)||''});document.querySelectorAll('[name="oidcClaimAvatar"]').forEach(function(el){el.value=(s.oidc.claims&&s.oidc.claims.avatar)||''});document.querySelectorAll('[name="telegramChatId"]').forEach(function(el){el.value=s.telegram?String(s.telegram.chatId||''):''});if(s.gotify){document.querySelectorAll('[name="gotifyUrl"]').forEach(function(el){el.value=s.gotify.url||''})}if(s.wxpush){document.querySelectorAll('[name="wxpushUrl"]').forEach(function(el){el.value=s.wxpush.url||''})}if($('ntfy-input'))$('ntfy-input').value=s.ntfyUrl||'';var si=$('settings-info');if(si)si.innerHTML='Vault：<code>'+esc(s.serverUrl||'')+'</code> · 端口 '+esc(s.port)+' · 绑定 '+esc(s.bind)+' · 自动解锁：'+(s.autoUnlock?'已启用':'未启用');var sec=$('security-info');if(sec)sec.innerHTML=s.autoUnlock?'主密码加密保存在容器卷（AES-GCM）。':'未启用自动解锁，重启后需手动输入主密码。';var nt=$('notify-info');if(nt)nt.innerHTML=s.ntfyUrl?'当前回调：<code>'+esc(s.ntfyUrl)+'</code>':'未配置 ntfy。';var tg=$('telegram-info');if(tg)tg.innerHTML=s.telegram&&s.telegram.configured?'Telegram 已配置（Chat '+esc(String(s.telegram.chatId||''))+'）':'未配置 Telegram；保存后需重启生效。';var gf=$('gotify-info');if(gf)gf.innerHTML=s.gotify&&s.gotify.configured?'Gotify 已配置：<code>'+esc(s.gotify.url||'')+'</code>':'未配置 Gotify。';var wx=$('wxpush-info');if(wx)wx.innerHTML=s.wxpush&&s.wxpush.configured?'wxpush 已配置：<code>'+esc(s.wxpush.url||'')+'</code>':'未配置 wxpush。';if(s.oidc&&s.oidc.issuer&&(!s.oidc.authorizationEndpoint||!s.oidc.tokenEndpoint)){try{var disc=await api('/api/oidc/discover?issuer='+encodeURIComponent(s.oidc.issuer));if(disc.ok){var setIfEmpty=function(name,val){document.querySelectorAll('[name="'+name+'"]').forEach(function(el){if(!el.value)el.value=val||''})};setIfEmpty('oidcAuthorizationEndpoint',disc.authorizationEndpoint);setIfEmpty('oidcTokenEndpoint',disc.tokenEndpoint);setIfEmpty('oidcUserinfoEndpoint',disc.userinfoEndpoint);setIfEmpty('oidcJwksUri',disc.jwksUri)}}catch(e){}}var si2=$('settings-info');if(si2&&s.encryptionKeyFingerprint)si2.innerHTML+='<br>加密密钥指纹：<code>'+esc(s.encryptionKeyFingerprint)+'</code>（AES-256-GCM）';}catch(e){}}
-async function saveSettings(){try{var data={publicUrl:settingsField('publicUrl'),serverUrl:settingsField('serverUrl'),oidcIssuer:settingsField('oidcIssuer'),oidcClientId:settingsField('oidcClientId'),oidcClientSecret:settingsField('oidcClientSecret'),oidcRedirectUri:settingsField('oidcRedirectUri'),oidcScope:settingsField('oidcScope'),oidcAuthorizationEndpoint:settingsField('oidcAuthorizationEndpoint'),oidcTokenEndpoint:settingsField('oidcTokenEndpoint'),oidcUserinfoEndpoint:settingsField('oidcUserinfoEndpoint'),oidcJwksUri:settingsField('oidcJwksUri'),oidcClaimIdentifier:settingsField('oidcClaimIdentifier'),oidcClaimName:settingsField('oidcClaimName'),oidcClaimEmail:settingsField('oidcClaimEmail'),oidcClaimAvatar:settingsField('oidcClaimAvatar'),ntfyUrl:$('ntfy-input')?$('ntfy-input').value:'',telegramToken:settingsField('telegramToken'),telegramChatId:settingsField('telegramChatId'),gotifyUrl:settingsField('gotifyUrl'),gotifyToken:settingsField('gotifyToken'),wxpushUrl:settingsField('wxpushUrl'),wxpushToken:settingsField('wxpushToken')};await post('/api/settings',data);toast('设置已保存');await loadSettings();await loadAll()}catch(e){toast(e.message,true)}}
+async function loadSettings(){try{var s=await api('/api/settings');state.agentWrite=s.agentWrite||{};document.querySelectorAll('[name="publicUrl"]').forEach(function(el){el.value=s.publicUrl||''});document.querySelectorAll('[name="serverUrl"]').forEach(function(el){el.value=s.serverUrl||''});document.querySelectorAll('[name="oidcIssuer"]').forEach(function(el){el.value=s.oidc.issuer||''});document.querySelectorAll('[name="oidcClientId"]').forEach(function(el){el.value=s.oidc.clientId||''});document.querySelectorAll('[name="oidcRedirectUri"]').forEach(function(el){el.value=s.oidc.redirectUri||''});document.querySelectorAll('[name="oidcAuthorizationEndpoint"]').forEach(function(el){el.value=s.oidc.authorizationEndpoint||''});document.querySelectorAll('[name="oidcTokenEndpoint"]').forEach(function(el){el.value=s.oidc.tokenEndpoint||''});document.querySelectorAll('[name="oidcUserinfoEndpoint"]').forEach(function(el){el.value=s.oidc.userinfoEndpoint||''});document.querySelectorAll('[name="oidcJwksUri"]').forEach(function(el){el.value=s.oidc.jwksUri||''});document.querySelectorAll('[name="oidcScope"]').forEach(function(el){el.value=s.oidc.scope||''});document.querySelectorAll('[name="oidcClaimIdentifier"]').forEach(function(el){el.value=(s.oidc.claims&&s.oidc.claims.identifier)||''});document.querySelectorAll('[name="oidcClaimName"]').forEach(function(el){el.value=(s.oidc.claims&&s.oidc.claims.name)||''});document.querySelectorAll('[name="oidcClaimEmail"]').forEach(function(el){el.value=(s.oidc.claims&&s.oidc.claims.email)||''});document.querySelectorAll('[name="oidcClaimAvatar"]').forEach(function(el){el.value=(s.oidc.claims&&s.oidc.claims.avatar)||''});document.querySelectorAll('[name="telegramChatId"]').forEach(function(el){el.value=s.telegram?String(s.telegram.chatId||''):''});document.querySelectorAll('[name="telegramUserId"]').forEach(function(el){el.value=s.telegram?String(s.telegram.userId||''):''});if(s.gotify){document.querySelectorAll('[name="gotifyUrl"]').forEach(function(el){el.value=s.gotify.url||''})}if(s.wxpush){document.querySelectorAll('[name="wxpushUrl"]').forEach(function(el){el.value=s.wxpush.url||''})}if($('ntfy-input'))$('ntfy-input').value=s.ntfyUrl||'';var si=$('settings-info');if(si)si.innerHTML='Vault：<code>'+esc(s.serverUrl||'')+'</code> · 端口 '+esc(s.port)+' · 绑定 '+esc(s.bind)+' · 自动解锁：'+(s.autoUnlock?'已启用':'未启用');var sec=$('security-info');if(sec)sec.innerHTML=s.autoUnlock?'主密码加密保存在容器卷（AES-GCM）。':'未启用自动解锁，重启后需手动输入主密码。';var nt=$('notify-info');if(nt)nt.innerHTML=s.ntfyUrl?'当前回调：<code>'+esc(s.ntfyUrl)+'</code>':'未配置 ntfy。';var tg=$('telegram-info');if(tg)tg.innerHTML=s.telegram&&s.telegram.configured?'Telegram 已配置（Chat '+esc(String(s.telegram.chatId||''))+'）':'未配置 Telegram；保存后需重启生效。';var gf=$('gotify-info');if(gf)gf.innerHTML=s.gotify&&s.gotify.configured?'Gotify 已配置：<code>'+esc(s.gotify.url||'')+'</code>':'未配置 Gotify。';var wx=$('wxpush-info');if(wx)wx.innerHTML=s.wxpush&&s.wxpush.configured?'wxpush 已配置：<code>'+esc(s.wxpush.url||'')+'</code>':'未配置 wxpush。';if(s.oidc&&s.oidc.issuer&&(!s.oidc.authorizationEndpoint||!s.oidc.tokenEndpoint)){try{var disc=await api('/api/oidc/discover?issuer='+encodeURIComponent(s.oidc.issuer));if(disc.ok){var setIfEmpty=function(name,val){document.querySelectorAll('[name="'+name+'"]').forEach(function(el){if(!el.value)el.value=val||''})};setIfEmpty('oidcAuthorizationEndpoint',disc.authorizationEndpoint);setIfEmpty('oidcTokenEndpoint',disc.tokenEndpoint);setIfEmpty('oidcUserinfoEndpoint',disc.userinfoEndpoint);setIfEmpty('oidcJwksUri',disc.jwksUri)}}catch(e){}}var si2=$('settings-info');if(si2&&s.encryptionKeyFingerprint)si2.innerHTML+='<br>加密密钥指纹：<code>'+esc(s.encryptionKeyFingerprint)+'</code>（AES-256-GCM）';}catch(e){}}
+async function saveSettings(){try{var data={publicUrl:settingsField('publicUrl'),serverUrl:settingsField('serverUrl'),oidcIssuer:settingsField('oidcIssuer'),oidcClientId:settingsField('oidcClientId'),oidcClientSecret:settingsField('oidcClientSecret'),oidcRedirectUri:settingsField('oidcRedirectUri'),oidcScope:settingsField('oidcScope'),oidcAuthorizationEndpoint:settingsField('oidcAuthorizationEndpoint'),oidcTokenEndpoint:settingsField('oidcTokenEndpoint'),oidcUserinfoEndpoint:settingsField('oidcUserinfoEndpoint'),oidcJwksUri:settingsField('oidcJwksUri'),oidcClaimIdentifier:settingsField('oidcClaimIdentifier'),oidcClaimName:settingsField('oidcClaimName'),oidcClaimEmail:settingsField('oidcClaimEmail'),oidcClaimAvatar:settingsField('oidcClaimAvatar'),ntfyUrl:$('ntfy-input')?$('ntfy-input').value:'',ntfyToken:$('ntfy-token')?$('ntfy-token').value:'',telegramToken:settingsField('telegramToken'),telegramChatId:settingsField('telegramChatId'),telegramUserId:settingsField('telegramUserId'),gotifyUrl:settingsField('gotifyUrl'),gotifyToken:settingsField('gotifyToken'),wxpushUrl:settingsField('wxpushUrl'),wxpushToken:settingsField('wxpushToken')};await post('/api/settings',data);toast('设置已保存');await loadSettings();await loadAll()}catch(e){toast(e.message,true)}}
 function renderInfo(){var s=state.status||{};var info=$('overview-info');if(info)info.innerHTML='Vault: <code>'+esc(s.publicUrl||'')+'</code> · OIDC 登录：'+(s.oidc?'已启用':'未启用')+' · ntfy 通知：'+(s.ntfy?'已启用':'未启用')+' · 自动解锁：'+(s.autoUnlock?'已启用':'未启用');
   var si=$('settings-info');if(si)si.innerHTML='公开地址：<code>'+esc(s.publicUrl||'')+'</code><br>OIDC：'+(s.oidc?'已启用':'未启用')+'<br>ntfy：'+(s.ntfy?'已启用':'未启用')+'<br>自动解锁：'+(s.autoUnlock?'已启用':'未启用')+'<br>Agents：'+esc((state.agents||[]).map(function(a){return a.name}).join(', '));
   var sec=$('security-info');if(sec)sec.innerHTML=s.autoUnlock?'主密码明文保存在容器卷的 <code>master-password</code> 文件中（600 权限）。删除后需手动解锁。':'未启用自动解锁，每次重启需要手动输入主密码。';
@@ -1197,7 +1337,7 @@ function renderItems(){var box=$('items-box');var q=($('item-search').value||'')
   box.innerHTML='<table><tr><th>名称</th><th>网址</th><th>分组</th><th>类型</th><th>操作</th></tr>'+items.map(function(i){return '<tr><td><code>'+esc(i.name)+'</code>'+(i.noApproval?' <span class="pill">免审批</span>':'')+'</td><td class="hint">'+esc(i.url||'')+'</td><td class="hint">'+esc(i.group||'')+'</td><td>'+esc(i.type)+'</td><td><button data-act="share" data-name="'+esc(i.name)+'">分享</button><button data-act="edit-item" data-name="'+esc(i.name)+'">编辑</button><button class="danger" data-act="item-delete" data-name="'+esc(i.name)+'">删除</button></td></tr>'}).join('')+'</table>';
   var gsel=$('group-filter');if(gsel){var current=gsel.value;var groups=Array.from(new Set(state.items.map(function(i){return i.group||''}))).filter(Boolean).sort();gsel.innerHTML='<option value="">全部分组</option>'+groups.map(function(g){return '<option value="'+esc(g)+'">'+esc(g)+'</option>'}).join('');gsel.value=current}}
 function renderAgents(){var box=$('agents-box');if(!state.agents.length){box.innerHTML='<div class="empty">暂无 agent</div>';return}
-  box.innerHTML='<table><tr><th>Agent</th><th>Token</th><th>可读条目</th><th>操作</th></tr>'+state.agents.map(function(a){var allow=a.allow&&a.allow.length?a.allow.join(', '):'全部';var label=a.alias||a.name;var tokenCell=a.oauth?'<code>OAuth 2.1</code>':'<code>'+esc(a.tokenPreview||'')+'</code> <button data-act="copy" data-agent="'+esc(a.name)+'">复制</button>';var ops='<button data-act="agent-alias" data-agent="'+esc(a.name)+'">改名</button>';if(!a.oauth){ops+='<button data-act="access" data-agent="'+esc(a.name)+'">设置可读</button><button data-act="agent-write" data-agent="'+esc(a.name)+'" data-allow="'+((state.agentWrite&&state.agentWrite[a.name])?'0':'1')+'">写入:'+((state.agentWrite&&state.agentWrite[a.name])?'开':'关')+'</button><button data-act="rotate" data-agent="'+esc(a.name)+'">轮换</button><button class="danger" data-act="agent-delete" data-agent="'+esc(a.name)+'">删除</button>'}return '<tr><td><b>'+esc(label)+'</b>'+(a.alias?'<br><span class="hint">'+esc(a.name)+'</span>':'')+'</td><td>'+tokenCell+'</td><td class="hint">'+esc(allow)+'</td><td>'+ops+'</td></tr>'}).join('')+'</table>'}
+  box.innerHTML='<table><tr><th>Agent</th><th>Token</th><th>可读条目</th><th>操作</th></tr>'+state.agents.map(function(a){var allow=a.allow&&a.allow.length?a.allow.join(', '):'无';var label=a.alias||a.name;var tokenCell=a.oauth?'<code>OAuth 2.1</code>':'<code>'+esc(a.tokenPreview||'')+'</code> <button data-act="copy" data-agent="'+esc(a.name)+'">复制</button>';var ops='<button data-act="agent-alias" data-agent="'+esc(a.name)+'">改名</button>';ops+='<button data-act="access" data-agent="'+esc(a.name)+'">设置可读</button><button data-act="agent-write" data-agent="'+esc(a.name)+'" data-allow="'+((state.agentWrite&&state.agentWrite[a.name])?'0':'1')+'">写入:'+((state.agentWrite&&state.agentWrite[a.name])?'开':'关')+'</button>';if(!a.oauth){ops+='<button data-act="rotate" data-agent="'+esc(a.name)+'">轮换</button>'}ops+='<button class="danger" data-act="agent-delete" data-agent="'+esc(a.name)+'">删除</button>';return '<tr><td><b>'+esc(label)+'</b>'+(a.alias?'<br><span class="hint">'+esc(a.name)+'</span>':'')+'</td><td>'+tokenCell+'</td><td class="hint">'+esc(allow)+'</td><td>'+ops+'</td></tr>'}).join('')+'</table>'}
 function renderGrants(){var box=$('grants-box');var rows=state.grants;if(!rows.length){box.innerHTML='<div class="empty">暂无授权</div>';return}
   var sort=$('g-sort').value,group=$('g-group').value;var list=rows.slice();var key=sort==='created'?function(g){return g.createdAt?Date.parse(g.createdAt):0}:sort==='agent'?function(g){return String(g.agent).toLowerCase()}:sort==='name'?function(g){return String(g.name).toLowerCase()}:function(g){return g.expiresAt==null?Number.MAX_SAFE_INTEGER:g.expiresAt};
   list.sort(function(x,y){var a=key(x),b=key(y);return a<b?-1:a>b?1:0});
@@ -1216,10 +1356,10 @@ async function loadLogs(reset){try{
 }catch(e){toast('日志加载失败：'+e.message,true)}}
 function openShare(name){state.shareItem=name;var agents=state.agents.map(function(a){return '<label class="chk"><input type="checkbox" class="share-agent" value="'+esc(a.name)+'">'+esc(a.name)+'</label>'}).join('');openModal('分享「'+name+'」','<div>'+agents+'</div><div class="row" style="margin-top:10px"><label class="hint">有效时间 <select id="share-ttl"><option value="1">1 小时</option><option value="24">24 小时</option><option value="168">7 天</option><option value="0">永久</option></select></label><label class="hint">可读次数 <input id="share-reads" type="number" min="1" placeholder="不限" style="width:90px"></label><button class="primary" data-act="share-go">分享</button></div>')}
 function openAccess(agent){var a=state.agents.find(function(x){return x.name===agent});if(!a)return;if(!state.items.length){toast('解锁并加载条目后再设置',true);return}
-  var all=(a.allow||[]).length===0;var boxes=state.items.map(function(i){var checked=all||(a.allow||[]).indexOf(i.name)>=0;return '<label class="chk"><input type="checkbox" class="access-item" value="'+esc(i.name)+'"'+(checked?' checked':'')+'>'+esc(i.name)+'</label>'}).join('');
+  var all=(a.allow||[]).indexOf('*')>=0;var boxes=state.items.map(function(i){var checked=all||(a.allow||[]).indexOf(i.name)>=0;return '<label class="chk"><input type="checkbox" class="access-item" value="'+esc(i.name)+'"'+(checked?' checked':'')+'>'+esc(i.name)+'</label>'}).join('');
   openModal('「'+agent+'」可读条目','<label class="chk"><input type="checkbox" id="access-all"'+(all?' checked':'')+'> 全部条目</label><div>'+boxes+'</div><div class="row"><button class="primary" data-act="access-save" data-agent="'+esc(agent)+'">保存</button></div>')}
 async function doShare(){var agents=[].slice.call(document.querySelectorAll('.share-agent:checked')).map(function(x){return x.value});if(!agents.length){toast('至少选一个 agent',true);return}var ttl=Number($('share-ttl').value);var reads=Number($('share-reads').value||0);for(var i=0;i<agents.length;i++){await post('/api/grants/create',{agent:agents[i],name:state.shareItem,ttlHours:ttl,maxReads:reads})}toast('已分享给 '+agents.join(', '));closeModal();loadAll()}
-async function doAccess(agent){var all=$('access-all').checked;var names=all?'':[].slice.call(document.querySelectorAll('.access-item:checked')).map(function(x){return x.value}).join(',');await post('/api/agents/access',{name:agent,allow:names});toast('已保存');closeModal();loadAll()}
+async function doAccess(agent){var all=$('access-all').checked;var names=all?'*':[].slice.call(document.querySelectorAll('.access-item:checked')).map(function(x){return x.value}).join(',');await post('/api/agents/access',{name:agent,allow:names});toast('已保存');closeModal();loadAll()}
 document.addEventListener('submit',async function(e){var f=e.target;try{
   if(f.id==='unlock-form'){e.preventDefault();toast('解锁中…');var r=await post('/api/unlock',{password:f.password.value});f.password.value='';toast(r.ok?'已解锁':'解锁失败');await loadAll()}
   else if(f.id==='item-form'){e.preventDefault();var d=new FormData(f);await post('/api/items/save',{name:d.get('name'),value:d.get('value')||'',notes:d.get('notes')||'',url:d.get('url')||'',group:d.get('group')||'',noApproval:d.get('noApproval')?'1':'0'});f.reset();toast('已保存');await loadAll()}
@@ -1288,16 +1428,18 @@ function agentFromRequest(req) {
   const presented = hashToken(token)
   // OAuth access tokens issued by the built-in MCP authorization server.
   const oauth = config.oauthTokens?.[hashToken(token)]
-  if (oauth !== undefined && oauth.expiresAt > Date.now()) return `oauth:${oauth.clientId}`
+  if (oauth !== undefined && oauth.expiresAt > Date.now()) {
+    if (!oauthEnabled()) return undefined
+    const client = config.oauthClients?.[oauth.clientId]
+    if (!client || client.revoked) return undefined
+    return `oauth:${oauth.clientId}`
+  }
   for (const [agent, value] of Object.entries(config.agents ?? {})) {
-    if (typeof value !== 'string' || value.length === 0) continue
-    if (value.startsWith('sha256:')) {
-      const a = Buffer.from(value)
-      const b = Buffer.from(presented)
-      if (a.length === b.length && crypto.timingSafeEqual(a, b)) return agent
-    } else if (value === token) {
-      return agent
-    }
+    if (agent.startsWith('oauth:')) continue
+    if (typeof value !== 'string' || !value.startsWith('sha256:') || isOauthPlaceholder(value)) continue
+    const a = Buffer.from(value)
+    const b = Buffer.from(presented)
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) return agent
   }
   return undefined
 }
@@ -1307,11 +1449,46 @@ function globMatch(pattern, name) {
   return new RegExp(`^${escaped}$`, 'i').test(name)
 }
 
-/** Agent item allowlist: empty/absent means "all items". Supports `*` globs. */
+/** Agent item allowlist: empty or missing means no access. `*` grants every name. */
 function agentAllowed(agent, name) {
   const patterns = config.agentAccess?.[agent]
-  if (!Array.isArray(patterns) || patterns.length === 0) return true
+  if (!Array.isArray(patterns) || patterns.length === 0) return false
   return patterns.some((pattern) => globMatch(pattern, name))
+}
+
+function agentRecordExists(name) {
+  if (config.agents?.[name]) return true
+  if (typeof name === 'string' && name.startsWith('oauth:')) return Boolean(config.oauthClients?.[name.slice(6)])
+  return false
+}
+
+function oauthEnabled() {
+  const flag = String(process.env.SECRETS_BROKER_OAUTH ?? '').toLowerCase()
+  if (flag === '0' || flag === 'false' || flag === 'off') return false
+  if (flag === '1' || flag === 'true' || flag === 'on') return true
+  return config.oauthEnabled === true
+}
+
+function oauthRegistrationEnabled() {
+  if (!oauthEnabled()) return false
+  const flag = String(process.env.SECRETS_BROKER_OAUTH_REGISTRATION ?? '').toLowerCase()
+  if (flag === '1' || flag === 'true' || flag === 'on') return true
+  return config.oauthAllowRegistration === true
+}
+
+function ensureOauthAgent(clientId) {
+  const name = `oauth:${clientId}`
+  config.agents ??= {}
+  config.agents[name] = null
+  config.agentAccess ??= {}
+  if (!Array.isArray(config.agentAccess[name])) config.agentAccess[name] = []
+  return name
+}
+
+function agentWriteError(agent, name) {
+  if (config.agentWrite?.[agent] !== true) return `agent "${agent}" is not allowed to create items`
+  if (!agentAllowed(agent, name)) return `agent "${agent}" is not allowed to write "${name}"`
+  return undefined
 }
 
 async function dashboard() {
@@ -1422,7 +1599,7 @@ ${items.length === 0 ? '<div class="empty">暂无条目</div>' : `<table><tr><th
 </div>
 <div class="card"><h2>Agents</h2>
 <div class="row"><form class="inline" method="post" action="/api/agents/add"><input type="text" name="name" placeholder="新 agent 名（如 codex-home）" required><button class="primary">添加</button></form></div>
-<table><tr><th>Agent</th><th>Token</th><th>可读条目（逗号分隔，支持 * 通配；空=全部）</th><th></th></tr>${Object.entries(config.agents ?? {}).map(([agent, token]) => `<tr><td>${esc(agent)}</td><td><code>${esc(token)}</code> <button onclick="copyText('${esc(token)}')">复制</button></td><td><form class="inline" method="post" action="/api/agents/access"><input type="hidden" name="name" value="${esc(agent)}"><input type="text" name="allow" value="${esc((config.agentAccess?.[agent] ?? []).join(','))}" placeholder="例如：prod/*,tavily-api-key" style="width:260px"><button>保存权限</button></form></td><td><form class="inline" method="post" action="/api/agents/rotate"><input type="hidden" name="name" value="${esc(agent)}"><button>轮换</button></form><form class="inline" method="post" action="/api/agents/delete"><input type="hidden" name="name" value="${esc(agent)}"><button class="danger">删除</button></form></td></tr>`).join('')}</table></div>
+<table><tr><th>Agent</th><th>Token</th><th>可读条目（逗号分隔，支持 * 通配；空=无权限，* 表示全部）</th><th></th></tr>${Object.entries(config.agents ?? {}).map(([agent, token]) => `<tr><td>${esc(agent)}</td><td><code>${esc(token)}</code> <button onclick="copyText('${esc(token)}')">复制</button></td><td><form class="inline" method="post" action="/api/agents/access"><input type="hidden" name="name" value="${esc(agent)}"><input type="text" name="allow" value="${esc((config.agentAccess?.[agent] ?? []).join(','))}" placeholder="例如：prod/*,tavily-api-key" style="width:260px"><button>保存权限</button></form></td><td><form class="inline" method="post" action="/api/agents/rotate"><input type="hidden" name="name" value="${esc(agent)}"><button>轮换</button></form><form class="inline" method="post" action="/api/agents/delete"><input type="hidden" name="name" value="${esc(agent)}"><button class="danger">删除</button></form></td></tr>`).join('')}</table></div>
 <div class="card"><h2>导入本机明文密钥</h2>
 <form class="inline" method="post" action="/api/import"><button>从 .credentials.yaml / .env / mcp-auth 导入</button></form>
 <div class="hint">Agent API：<code>GET /secret?name=条目名</code>（Bearer token）· CLI：<code>node wh.mjs get 条目名</code> · 注入进程：<code>node wh.mjs run --var NAME=条目名 -- 命令</code><br>条目名可用 <code>项目/环境/名称</code> 约定做分类（如 <code>blog/prod/tavily-key</code>），配合 agent 权限前缀控制。</div></div>
@@ -1481,27 +1658,72 @@ refresh();
 }
 
 // ---- agent flow ----
-async function createPending(agent, name) {
+const UNTRUSTED_TEXT_LIMIT = 120
+function pendingTtl() {
+  const value = Number(process.env.SECRETS_BROKER_PENDING_TTL_MS ?? 10 * 60 * 1000)
+  return Number.isFinite(value) && value > 0 ? value : 10 * 60 * 1000
+}
+function clipUntrusted(value) {
+  return String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069\u200b-\u200f\ufeff]/g, '')
+    .trim()
+    .slice(0, UNTRUSTED_TEXT_LIMIT)
+}
+const PENDING_PER_AGENT = 5
+function prunePending() {
+  const ttl = pendingTtl()
+  const now = Date.now()
+  for (const [id, entry] of state.pending) {
+    if (now - entry.createdAt > ttl) state.pending.delete(id)
+  }
+  pruneApprovalTokens()
+}
+function pendingCount(agent) {
+  let count = 0
+  for (const entry of state.pending.values()) {
+    if (entry.agent === agent && entry.status === 'pending') count += 1
+  }
+  return count
+}
+async function createPending(agent, name, extra = {}) {
+  prunePending()
   for (const entry of state.pending.values()) {
     if (entry.agent === agent && entry.name === name && entry.status === 'pending') return entry
   }
-  const entry = { id: crypto.randomUUID(), agent, name, createdAt: Date.now(), status: 'pending' }
+  if (pendingCount(agent) >= PENDING_PER_AGENT) return undefined
+  const entry = {
+    id: crypto.randomUUID(),
+    agent,
+    name,
+    createdAt: Date.now(),
+    status: 'pending',
+    reason: clipUntrusted(extra.reason),
+    command: clipUntrusted(extra.command),
+  }
   state.pending.set(entry.id, entry)
   audit({ event: 'request.create', agent, name })
   notifyPending(entry)
   return entry
 }
 
+function approvalMessage(entry) {
+  const lines = [
+    'Secrets Broker approval',
+    `Bot: ${entry.agent}`,
+    `Secret: ${clipUntrusted(entry.name)}`,
+    'Duration: choose an action (once, 1 hour, 24 hours, or deny).',
+    '',
+    'Untrusted text from the bot (not checked by the broker):',
+    `Reason: ${entry.reason || '(none)'}`,
+  ]
+  if (entry.command) lines.push(`Command: ${entry.command}`)
+  return lines.join('\n')
+}
+
 /** Optional push notification (ntfy) when a new approval request appears. */
 function notifyPending(entry) {
   telegramNotify(entry).catch(() => {})
-  const text = [
-    `Secrets Broker: 代理 ${entry.agent} 请求读取「${entry.name}」`,
-    `允许一次：${approvalUrl(entry.id, 'once')}`,
-    `允许 24 小时：${approvalUrl(entry.id, '24h')}`,
-    `拒绝：${approvalUrl(entry.id, 'deny')}`,
-    `管理页：${PUBLIC_URL}/`,
-  ].join('\n')
+  const text = approvalMessage(entry)
   if (GOTIFY_URL && GOTIFY_TOKEN) {
     fetch(`${GOTIFY_URL}/message`, {
       method: 'POST',
@@ -1517,15 +1739,20 @@ function notifyPending(entry) {
     }).catch(() => {})
   }
   if (!NTFY_URL) return
-  fetch(NTFY_URL, {
-    method: 'POST',
-    headers: { Title: 'Secrets Broker approval', Tags: 'lock', Priority: 'high' },
-    body: text,
-  }).catch(() => {})
+  const headers = {
+    Title: 'Secrets Broker approval',
+    Tags: 'lock',
+    Priority: 'high',
+    Actions: JSON.stringify(ntfyActions(entry)),
+  }
+  if (NTFY_TOKEN) headers.Authorization = `Bearer ${NTFY_TOKEN}`
+  fetch(NTFY_URL, { method: 'POST', headers, body: text }).catch(() => {})
 }
 
 /** Apply an approval decision to a pending request (shared by web, Telegram, ntfy). */
 function decideRequest(id, decision, source = 'web') {
+  const allowed = new Set(['deny', 'once', '1h', '24h', '7d', 'always'])
+  if (!allowed.has(decision)) return { ok: false, error: 'invalid decision' }
   const entry = state.pending.get(id)
   if (entry === undefined || entry.status !== 'pending') return { ok: false, error: '请求不存在或已处理' }
   if (!state.unlocked) return { ok: false, error: '请先解锁 vault' }
@@ -1553,6 +1780,77 @@ function approvalUrl(id, decision, ttlMs = 10 * 60 * 1000) {
   const exp = Date.now() + ttlMs
   const sig = approvalSignature(id, decision, exp)
   return `${PUBLIC_URL}/approve/${encodeURIComponent(id)}?d=${encodeURIComponent(decision)}&exp=${exp}&sig=${sig}`
+}
+const approvalTokens = new Map()
+function approvalTokenTtl() {
+  const value = Number(process.env.SECRETS_BROKER_APPROVAL_TOKEN_TTL_MS ?? 10 * 60 * 1000)
+  return Number.isFinite(value) && value > 0 ? value : 10 * 60 * 1000
+}
+function pruneApprovalTokens() {
+  const now = Date.now()
+  for (const [token, entry] of approvalTokens) {
+    if (!entry || entry.exp <= now) approvalTokens.delete(token)
+  }
+}
+function issueApprovalToken(id, decision) {
+  pruneApprovalTokens()
+  const token = crypto.randomBytes(32).toString('base64url')
+  approvalTokens.set(token, { id, decision, exp: Date.now() + approvalTokenTtl() })
+  return token
+}
+function takeApprovalToken(token) {
+  pruneApprovalTokens()
+  if (!token) return undefined
+  const entry = approvalTokens.get(token)
+  if (!entry) return undefined
+  approvalTokens.delete(token)
+  if (entry.exp < Date.now()) return undefined
+  return entry
+}
+function ntfyActions(entry) {
+  return [
+    ['Allow once', 'once'],
+    ['Allow 1h', '1h'],
+    ['Allow 24h', '24h'],
+    ['Deny', 'deny'],
+  ].map(([label, decision]) => ({
+    action: 'http',
+    label,
+    url: `${PUBLIC_URL}/approve/${encodeURIComponent(entry.id)}`,
+    method: 'POST',
+    headers: { Authorization: `Bearer ${issueApprovalToken(entry.id, decision)}` },
+    body: `decision=${decision}`,
+  }))
+}
+function approvalSigValid(id, decision, exp, sig) {
+  const expected = approvalSignature(id, decision, Number(exp))
+  const provided = String(sig ?? '')
+  return Number(exp) > Date.now() && provided.length > 0 && expected.length === provided.length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(provided))
+}
+function approvalConfirmPage(id, decision, exp, sig) {
+  return `<!doctype html><html lang="zh"><head><meta charset="utf-8"><title>确认授权</title>
+<style>body{font-family:system-ui;background:#0e1119;color:#e7ebf3;max-width:520px;margin:60px auto;padding:0 18px}button{padding:8px 14px;border-radius:8px;border:0;background:#5b8cff;color:#fff;cursor:pointer}</style></head><body>
+<h2>确认这次授权</h2>
+<p>打开链接不会批准。只有提交下面的表单才会生效。</p>
+<p>决定：<b>${esc(decision)}</b></p>
+<form method="post" action="/approve/${encodeURIComponent(id)}">
+<input type="hidden" name="d" value="${esc(decision)}">
+<input type="hidden" name="exp" value="${esc(exp)}">
+<input type="hidden" name="sig" value="${esc(sig)}">
+<button type="submit">确认</button>
+</form></body></html>`
+}
+function reserveGrantRead(agent, name) {
+  const grant = validGrant(agent, name)
+  if (grant === undefined) return undefined
+  grant.reads = (grant.reads ?? 0) + 1
+  saveGrants()
+  return grant
+}
+function releaseGrantRead(grant) {
+  if (!grant) return
+  grant.reads = Math.max(0, (grant.reads ?? 1) - 1)
+  saveGrants()
 }
 
 // ---- built-in OAuth 2.1 authorization server for MCP ----
@@ -1605,7 +1903,8 @@ function oauthConsentPage(params, client, message = '', loggedIn = false) {
 <p class="muted">授权后它将能：列出密钥名称；按你的审批读取；若开启写入权限还能创建条目。</p>
 ${message ? `<p style="color:#ffb4b4">${esc(message)}</p>` : ''}
 <form method="post" action="/oauth/approve">${hidden}
-${loggedIn ? '' : '<label class="muted">管理密码</label><input type="password" name="password" placeholder="管理密码" required>'}
+<label class="muted">管理密码</label><input type="password" name="password" placeholder="管理密码" required>
+${config.profile?.totpEnabled ? '<label class="muted">两步验证码</label><input name="code" inputmode="numeric" placeholder="6 位验证码" autocomplete="one-time-code" required>' : ''}
 <div style="margin-top:10px"><button name="decision" value="allow">允许</button><button class="deny" name="decision" value="deny">拒绝</button></div>
 </form></body></html>`
 }
@@ -1672,16 +1971,25 @@ const GOTIFY_URL = (config.gotify?.url ?? process.env.GOTIFY_URL ?? '').replace(
 const GOTIFY_TOKEN = config.gotify?.token ?? process.env.GOTIFY_TOKEN ?? ''
 const WXPUSH_URL = (config.wxpush?.url ?? process.env.WXPUSH_URL ?? '').replace(/\/+$/, '')
 const WXPUSH_TOKEN = config.wxpush?.token ?? process.env.WXPUSH_TOKEN ?? ''
-function telegramChat() {
-  return String(config.telegram?.chatId ?? process.env.TELEGRAM_CHAT_ID ?? '')
+function configuredValue(configValue, envValue) {
+  const fromConfig = String(configValue ?? '').trim()
+  if (fromConfig) return fromConfig
+  return String(envValue ?? '').trim()
 }
+function telegramChat() {
+  return configuredValue(config.telegram?.chatId, process.env.TELEGRAM_CHAT_ID)
+}
+function telegramUser() {
+  return configuredValue(config.telegram?.userId, process.env.TELEGRAM_USER_ID)
+}
+const TELEGRAM_API = (process.env.SECRETS_BROKER_TELEGRAM_API ?? 'https://api.telegram.org').replace(/\/+$/, '')
 let telegramOffset = 0
 let telegramPolling = false
 
 async function telegramApi(method, payload) {
   if (!TELEGRAM_TOKEN) return undefined
   try {
-    const response = await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/${method}`, {
+    const response = await fetch(`${TELEGRAM_API}/bot${TELEGRAM_TOKEN}/${method}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
@@ -1693,7 +2001,7 @@ async function telegramApi(method, payload) {
 }
 
 async function telegramNotify(entry) {
-  if (!TELEGRAM_TOKEN || !telegramChat()) return
+  if (!TELEGRAM_TOKEN || !telegramChat() || !telegramUser()) return
   const keyboard = [
     [
       { text: '仅本次', callback_data: `apr:${entry.id}:once` },
@@ -1709,7 +2017,7 @@ async function telegramNotify(entry) {
   ]
   await telegramApi('sendMessage', {
     chat_id: telegramChat(),
-    text: `🔐 Secrets Broker\n代理：${entry.agent}\n条目：${entry.name}\n\n请选择授权方式：`,
+    text: `🔐 Secrets Broker\n${approvalMessage(entry)}\n\n请选择授权方式：`,
     reply_markup: { inline_keyboard: keyboard },
   })
 }
@@ -1721,18 +2029,22 @@ async function telegramPoll() {
     const result = await telegramApi('getUpdates', { offset: telegramOffset, timeout: 0, allowed_updates: ['callback_query', 'message'] })
     for (const update of result?.result ?? []) {
       telegramOffset = update.update_id + 1
-      if (update.message && update.message.chat) {
+      if (update.message?.chat) {
         const chatId = String(update.message.chat.id)
-        if (chatId !== telegramChat()) {
-          config.telegram ??= {}
-          config.telegram.chatId = chatId
-          saveConfig()
-          audit({ event: 'telegram.bind', chatId })
-          await telegramApi('sendMessage', { chat_id: chatId, text: '✅ 已绑定 Secrets Broker 通知，之后审批消息会发到这里。' })
+        const userId = String(update.message.from?.id ?? '')
+        if (chatId !== telegramChat() || userId !== telegramUser()) {
+          audit({ event: 'telegram.reject', chatId, userId })
         }
       }
       const query = update.callback_query
       if (!query) continue
+      const fromId = String(query.from?.id ?? '')
+      const chatId = String(query.message?.chat?.id ?? '')
+      if (!telegramChat() || !telegramUser() || fromId !== telegramUser() || chatId !== telegramChat()) {
+        audit({ event: 'telegram.reject', chatId, userId: fromId })
+        await telegramApi('answerCallbackQuery', { callback_query_id: query.id, text: 'unauthorized' })
+        continue
+      }
       const data = String(query.data ?? '')
       const [kind, id, decision] = data.split(':')
       let answer = ''
@@ -1759,8 +2071,6 @@ async function telegramPoll() {
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${config.port}`)
-  const remote = req.socket.remoteAddress ?? ''
-  const isLocal = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1'
   const isAgentPath =
     url.pathname === '/secret' ||
     url.pathname.startsWith('/secret/') ||
@@ -1774,6 +2084,7 @@ const server = http.createServer(async (req, res) => {
       const discovery = await oidcDiscovery()
       if (url.pathname === '/oidc/login') {
         const bind = url.searchParams.get('bind') === '1'
+        if (bind && !isAdmin(req)) return html(res, loginPage('绑定 OIDC 需要先用管理密码登录'))
         const state = randomUrlSafe(24)
         const nonce = randomUrlSafe(24)
         const verifier = randomUrlSafe(48)
@@ -1793,7 +2104,7 @@ const server = http.createServer(async (req, res) => {
             `broker_oidc_state=${state}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600`,
             `broker_oidc_nonce=${nonce}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600`,
             `broker_oidc_verifier=${verifier}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600`,
-            `broker_oidc_bind=${bind ? '1' : '0'}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600`,
+            `broker_oidc_bind=${bind && isAdmin(req) ? '1' : '0'}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600`,
           ],
         })
         return res.end()
@@ -1827,25 +2138,33 @@ const server = http.createServer(async (req, res) => {
       const mappedName = claims[claimMap.name ?? 'name'] ?? claims.name ?? ''
       const mappedAvatar = claims[claimMap.avatar ?? 'picture'] ?? claims.picture ?? ''
       if (!config.profile) config.profile = {}
+      const subject = String(identifier ?? '')
+      if (!subject) throw new Error('id_token has no subject')
       const bindRequested = jar.broker_oidc_bind === '1'
-      if (bindRequested || !config.profile.oidcSub) {
-        config.profile.oidcSub = String(identifier ?? '')
+      if (bindRequested) {
+        if (!isAdmin(req)) throw new Error('OIDC binding requires an authenticated admin session')
+        config.profile.oidcSub = subject
         config.profile.oidcEmail = mappedEmail
         if (!config.profile.email && mappedEmail) config.profile.email = mappedEmail
         if (!config.profile.name && mappedName) config.profile.name = mappedName
         if (!config.profile.avatarUrl && mappedAvatar) config.profile.avatarUrl = mappedAvatar
         saveConfig()
-        audit({ event: 'profile.oidc-bind', sub: identifier, email: mappedEmail, explicit: bindRequested })
+        audit({ event: 'profile.oidc-bind', sub: subject, email: mappedEmail, explicit: true })
+      } else {
+        const bound = String(config.profile.oidcSub ?? '')
+        if (!bound) throw new Error('OIDC account is not bound. Sign in with the admin password and bind the owner from the profile page.')
+        if (!safeEqualString(bound, subject)) throw new Error('OIDC account is not the bound owner')
       }
-      audit({ event: 'admin.oidc-login', sub: identifier, email: mappedEmail })
+      audit({ event: 'admin.oidc-login', sub: subject, email: mappedEmail })
+      const sessionId = createAdminSession()
       res.writeHead(302, {
-        location: jar.broker_oidc_bind === '1' ? '/#/profile' : '/',
+        location: bindRequested ? '/#/profile' : '/',
         'set-cookie': [
-          `broker_admin=${adminCookieValue()}; HttpOnly; SameSite=Lax; Path=/`,
-          'broker_oidc_state=; Max-Age=0; Path=/',
-          'broker_oidc_nonce=; Max-Age=0; Path=/',
-          'broker_oidc_verifier=; Max-Age=0; Path=/',
-          'broker_oidc_bind=; Max-Age=0; Path=/',
+          adminCookie(sessionId, req),
+          'broker_oidc_state=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0',
+          'broker_oidc_nonce=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0',
+          'broker_oidc_verifier=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0',
+          'broker_oidc_bind=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0',
         ],
       })
       return res.end()
@@ -1855,14 +2174,27 @@ const server = http.createServer(async (req, res) => {
   }
 
   const approveMatch = url.pathname.match(/^\/approve\/([^/]+)$/)
-  if (req.method === 'GET' && approveMatch) {
-    const id = approveMatch[1]
-    const decision = url.searchParams.get('d') ?? ''
-    const exp = Number(url.searchParams.get('exp') ?? 0)
-    const sig = url.searchParams.get('sig') ?? ''
-    const expected = approvalSignature(id, decision, exp)
-    const valid = exp > Date.now() && sig.length > 0 && expected.length === sig.length && crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sig))
-    if (!valid) return html(res, '<h2>链接无效或已过期</h2><p><a href="/">打开管理页</a></p>')
+  if (approveMatch && (req.method === 'GET' || req.method === 'POST')) {
+    const id = decodeURIComponent(approveMatch[1])
+    if (req.method === 'GET') {
+      const decision = url.searchParams.get('d') ?? ''
+      const exp = url.searchParams.get('exp') ?? ''
+      const sig = url.searchParams.get('sig') ?? ''
+      if (!approvalSigValid(id, decision, exp, sig)) return html(res, '<h2>链接无效或已过期</h2><p><a href="/">打开管理页</a></p>')
+      return html(res, approvalConfirmPage(id, decision, exp, sig))
+    }
+    const body = await parseBody(req)
+    const header = String(req.headers.authorization ?? '')
+    const bearer = header.startsWith('Bearer ') ? header.slice(7).trim() : ''
+    const presented = bearer || String(body.token ?? '')
+    let decision = String(body.d ?? body.decision ?? '')
+    if (presented) {
+      const issued = takeApprovalToken(presented)
+      if (!issued || issued.id !== id) return html(res, '<h2>链接无效或已过期</h2><p><a href="/">打开管理页</a></p>')
+      decision = issued.decision
+    } else if (!approvalSigValid(id, decision, body.exp, body.sig)) {
+      return html(res, '<h2>链接无效或已过期</h2><p><a href="/">打开管理页</a></p>')
+    }
     const outcome = decideRequest(id, decision, 'ntfy')
     return html(
       res,
@@ -1877,16 +2209,23 @@ const server = http.createServer(async (req, res) => {
     '/.well-known/oauth-authorization-server/mcp',
   ])
   if (req.method === 'GET' && oauthMetadataPaths.has(url.pathname)) {
+    if (!oauthEnabled()) return json(res, 404, { error: 'oauth_disabled' })
     res.setHeader('access-control-allow-origin', '*')
     if (url.pathname.includes('protected-resource')) return json(res, 200, oauthProtectedResource())
-    return json(res, 200, oauthServerMetadata())
+    const metadata = oauthServerMetadata()
+    if (!oauthRegistrationEnabled()) delete metadata.registration_endpoint
+    return json(res, 200, metadata)
   }
 
   if (req.method === 'POST' && url.pathname === '/oauth/register') {
+    if (!oauthEnabled()) return json(res, 404, { error: 'oauth_disabled' })
+    if (!oauthRegistrationEnabled() || !isAdmin(req)) return json(res, 403, { error: 'registration_disabled' })
     try {
       const body = await parseBody(req)
-      const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris.filter((uri) => typeof uri === 'string') : []
+      const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris.filter((uri) => typeof uri === 'string' && uri.length <= 500).slice(0, 5) : []
       if (redirectUris.length === 0) return json(res, 400, { error: 'invalid_client_metadata', error_description: 'redirect_uris is required' })
+      config.oauthClients ??= {}
+      if (Object.keys(config.oauthClients).length >= 32) return json(res, 429, { error: 'too_many_clients' })
       const clientId = `mcp_${randomUrlSafe(12)}`
       config.oauthClients ??= {}
       config.oauthClients[clientId] = {
@@ -1894,7 +2233,9 @@ const server = http.createServer(async (req, res) => {
         clientName: typeof body.client_name === 'string' ? body.client_name.slice(0, 120) : 'MCP client',
         redirectUris,
         createdAt: new Date().toISOString(),
+        revoked: false,
       }
+      ensureOauthAgent(clientId)
       saveConfig()
       audit({ event: 'oauth.client-register', clientId, clientName: config.oauthClients[clientId].clientName })
       res.setHeader('access-control-allow-origin', '*')
@@ -1913,6 +2254,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && url.pathname === '/oauth/authorize') {
+    if (!oauthEnabled()) return json(res, 404, { error: 'oauth_disabled' })
     const params = Object.fromEntries(url.searchParams.entries())
     const client = config.oauthClients?.[params.client_id]
     if (!client) return html(res, oauthConsentPage(params, undefined, '未知的 client_id'))
@@ -1923,20 +2265,26 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'POST' && url.pathname === '/oauth/approve') {
+    if (!oauthEnabled()) return json(res, 404, { error: 'oauth_disabled' })
+    const throttle = loginThrottle(req, 'oauth')
+    if (throttle.blocked) {
+      audit({ event: 'oauth.approve-blocked', ip: throttle.ip })
+      res.writeHead(429, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+      return res.end('<h2>尝试次数过多，请 5 分钟后再试</h2>')
+    }
     const body = await parseBody(req)
     const params = body
     const client = config.oauthClients?.[params.client_id]
-    if (!client) return html(res, '<h2>未知的 client_id</h2>')
+    if (!client || client.revoked) return html(res, '<h2>未知的 client_id</h2>')
     if (!client.redirectUris.includes(params.redirect_uri)) return html(res, '<h2>redirect_uri 未注册</h2>')
-    let authorized = isAdmin(req)
-    if (!authorized) {
-      if (body.password === ADMIN_PASSWORD) {
-        authorized = true
-      } else if (config.profile?.totpEnabled && verifyTotp(config.profile.totpSecret, String(body.code ?? ''))) {
-        authorized = true
-      }
+    const passwordOk = passwordMatches(body.password)
+    const totpOk = config.profile?.totpEnabled !== true || verifyTotp(config.profile.totpSecret, String(body.code ?? ''))
+    if (!passwordOk || !totpOk) {
+      recordLoginFailure(throttle.key)
+      audit({ event: 'oauth.approve-fail', ip: throttle.ip })
+      return html(res, oauthConsentPage(params, client, '密码或验证码错误', false))
     }
-    if (!authorized) return html(res, oauthConsentPage(params, client, '密码或验证码错误', false))
+    loginFailures.delete(throttle.key)
     if (params.decision !== 'allow') {
       res.writeHead(302, { location: redirectWith(params.redirect_uri, { error: 'access_denied', state: params.state }) })
       return res.end()
@@ -1955,6 +2303,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'POST' && url.pathname === '/oauth/token') {
+    if (!oauthEnabled()) return json(res, 404, { error: 'oauth_disabled' })
     const body = await parseBody(req)
     if (body.grant_type !== 'authorization_code') return json(res, 400, { error: 'unsupported_grant_type' })
     const entry = oauthCodes.get(String(body.code ?? ''))
@@ -1964,7 +2313,8 @@ const server = http.createServer(async (req, res) => {
     if (String(body.redirect_uri) !== entry.redirectUri) return json(res, 400, { error: 'invalid_grant' })
     if (!pkceMatches(String(body.code_verifier ?? ''), entry.codeChallenge)) return json(res, 400, { error: 'invalid_grant', error_description: 'PKCE verification failed' })
     const accessToken = randomUrlSafe(32)
-    const agent = `oauth:${entry.clientId}`
+    const agent = ensureOauthAgent(entry.clientId)
+    if (config.oauthClients?.[entry.clientId]?.revoked) return json(res, 400, { error: 'invalid_grant' })
     config.oauthTokens ??= {}
     for (const [key, token] of Object.entries(config.oauthTokens)) {
       if (token.expiresAt <= Date.now()) delete config.oauthTokens[key]
@@ -1986,50 +2336,47 @@ const server = http.createServer(async (req, res) => {
       return html(res, loginPage())
     }
     if (req.method === 'POST' && url.pathname === '/login') {
-      const throttle = loginThrottle(req)
+      const throttle = loginThrottle(req, 'login')
       if (throttle.blocked) {
         audit({ event: 'admin.login-blocked', ip: throttle.ip })
         res.writeHead(429, { 'content-type': 'text/html; charset=utf-8' })
         return res.end(loginPage('尝试次数过多，请 5 分钟后再试'))
       }
       const body = form(await readBody(req))
-      if (body.get('password') === ADMIN_PASSWORD) {
-        if (config.profile?.totpEnabled) {
-          if (!verifyTotp(config.profile.totpSecret, body.get('code') ?? '')) {
-            recordLoginFailure(throttle.ip)
-            audit({ event: 'admin.2fa-fail', ip: throttle.ip })
-            return html(res, loginPage('两步验证码错误'))
-          }
-        }
-        loginFailures.delete(throttle.ip)
+      const passwordOk = passwordMatches(body.get('password'))
+      const totpOk = config.profile?.totpEnabled !== true || verifyTotp(config.profile.totpSecret, body.get('code') ?? '')
+      if (passwordOk && totpOk) {
+        loginFailures.delete(throttle.key)
         res.writeHead(303, {
           location: '/',
-          'set-cookie': `broker_admin=${adminCookieValue()}; HttpOnly; SameSite=Lax; Path=/`,
+          'set-cookie': adminCookie(createAdminSession(), req),
         })
         return res.end()
       }
-      recordLoginFailure(throttle.ip)
+      if (passwordOk && !totpOk) {
+        recordLoginFailure(throttle.key)
+        audit({ event: 'admin.2fa-fail', ip: throttle.ip })
+        return html(res, loginPage('两步验证码错误'))
+      }
+      recordLoginFailure(throttle.key)
       audit({ event: 'admin.login-fail', ip: throttle.ip })
       return html(res, loginPage('密码错误'))
     }
-    if (!AUTH_REQUIRED) {
-      if (!isLocal) {
-        return json(res, 403, {
-          error: 'local only; set SECRETS_BROKER_ADMIN_PASSWORD to allow remote administration',
-        })
-      }
-    } else if (!isAdmin(req)) {
-      return html(res, loginPage(''))
+    if (!isAdmin(req)) {
+      const message = AUTH_REQUIRED ? '' : '请设置 SECRETS_BROKER_ADMIN_PASSWORD'
+      if (url.pathname.startsWith('/api/')) return json(res, 401, { error: message || 'login required' })
+      return html(res, loginPage(message))
     }
   }
 
   try {
     if (req.method === 'POST' && url.pathname === '/api/logout') {
+      destroyAdminSession(req)
       if (wantsJson(req)) {
-        res.setHeader('set-cookie', 'broker_admin=; Max-Age=0; Path=/')
+        res.setHeader('set-cookie', clearAdminCookie(req))
         return json(res, 200, { ok: true })
       }
-      res.writeHead(303, { location: '/', 'set-cookie': 'broker_admin=; Max-Age=0; Path=/' })
+      res.writeHead(303, { location: '/', 'set-cookie': clearAdminCookie(req) })
       return res.end()
     }
     if (req.method === 'GET' && url.pathname === '/') return html(res, dashboardShellV2())
@@ -2085,22 +2432,26 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url.pathname === '/api/agents') {
       const tokens = loadAgentTokens()
-      const agents = Object.entries(config.agents ?? {}).map(([name, token]) => ({
-        name,
-        alias: config.agentAliases?.[name] ?? '',
-        tokenPreview: tokens[name] ? maskToken(tokens[name]) : `sha256:${String(token).slice(7, 11)}…`,
-        allow: config.agentAccess?.[name] ?? [],
-        write: config.agentWrite?.[name] === true,
-        oauth: false,
-      }))
+      const agents = Object.entries(config.agents ?? {}).map(([name, token]) => {
+        const oauth = name.startsWith('oauth:') || token === 'oauth'
+        return {
+          name,
+          alias: config.agentAliases?.[name] ?? '',
+          tokenPreview: oauth ? 'OAuth 2.1' : tokens[name] ? maskToken(tokens[name]) : `sha256:${String(token).slice(7, 11)}…`,
+          allow: config.agentAccess?.[name] ?? [],
+          write: config.agentWrite?.[name] === true,
+          oauth,
+        }
+      })
+      const known = new Set(agents.map((agent) => agent.name))
       const oauthAgents = [...new Set(Object.values(config.oauthTokens ?? {}).map((token) => token.agent))]
-        .filter((agent) => typeof agent === 'string' && agent.length > 0)
+        .filter((agent) => typeof agent === 'string' && agent.length > 0 && !known.has(agent))
         .map((agent) => ({
           name: agent,
           alias: config.agentAliases?.[agent] ?? '',
           tokenPreview: 'OAuth 2.1',
-          allow: [],
-          write: false,
+          allow: config.agentAccess?.[agent] ?? [],
+          write: config.agentWrite?.[agent] === true,
           oauth: true,
         }))
       return json(res, 200, { agents: [...agents, ...oauthAgents] })
@@ -2122,7 +2473,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/agents/token') {
       const body = form(await readBody(req))
       const name = body.get('name') ?? ''
-      if (!config.agents[name]) return json(res, 404, { error: 'unknown agent' })
+      if (!config.agents[name] || config.agents[name] === 'oauth' || name.startsWith('oauth:')) return json(res, 404, { error: 'unknown agent' })
       const tokens = loadAgentTokens()
       if (!tokens[name]) return json(res, 409, { error: '该 agent 的明文 token 不在本机 token 文件中，请轮换生成新 token' })
       audit({ event: 'agent.token-reveal', agent: name })
@@ -2180,7 +2531,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/agents/write') {
       const body = form(await readBody(req))
       const name = body.get('name') ?? ''
-      if (!config.agents[name]) return json(res, 404, { error: 'unknown agent' })
+      if (!agentRecordExists(name)) return json(res, 404, { error: 'unknown agent' })
       config.agentWrite ??= {}
       config.agentWrite[name] = body.get('allow') === '1'
       saveConfig()
@@ -2190,7 +2541,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/agents/access') {
       const body = form(await readBody(req))
       const name = body.get('name') ?? ''
-      if (!config.agents[name]) return json(res, 404, { error: 'unknown agent' })
+      if (!agentRecordExists(name)) return json(res, 404, { error: 'unknown agent' })
       const raw = (body.get('allow') ?? '').trim()
       config.agentAccess ??= {}
       config.agentAccess[name] = raw.length === 0 ? [] : raw.split(',').map((part) => part.trim()).filter(Boolean)
@@ -2201,7 +2552,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/agents/rotate') {
       const body = form(await readBody(req))
       const name = body.get('name') ?? ''
-      if (!config.agents[name]) return json(res, 404, { error: 'unknown agent' })
+      if (!config.agents[name] || config.agents[name] === 'oauth' || name.startsWith('oauth:')) return json(res, 404, { error: 'unknown agent' })
       const newToken = randomToken()
       config.agents[name] = hashToken(newToken)
       const tokens = loadAgentTokens()
@@ -2214,8 +2565,17 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && url.pathname === '/api/agents/delete') {
       const body = form(await readBody(req))
       const name = body.get('name') ?? ''
-      if (!config.agents[name]) return json(res, 404, { error: 'unknown agent' })
+      if (!agentRecordExists(name)) return json(res, 404, { error: 'unknown agent' })
+      if (name.startsWith('oauth:')) {
+        const clientId = name.slice(6)
+        if (config.oauthClients?.[clientId]) config.oauthClients[clientId].revoked = true
+        for (const [key, token] of Object.entries(config.oauthTokens ?? {})) {
+          if (token.clientId === clientId || token.agent === name) delete config.oauthTokens[key]
+        }
+      }
       delete config.agents[name]
+      if (config.agentAccess) delete config.agentAccess[name]
+      if (config.agentWrite) delete config.agentWrite[name]
       const tokens = loadAgentTokens()
       delete tokens[name]
       saveAgentTokens(tokens)
@@ -2257,7 +2617,7 @@ const server = http.createServer(async (req, res) => {
       const body = form(await readBody(req))
       const agent = (body.get('agent') ?? '').trim()
       const name = (body.get('name') ?? '').trim()
-      if (!config.agents[agent]) return json(res, 404, { error: 'unknown agent' })
+      if (!agentRecordExists(agent)) return json(res, 404, { error: 'unknown agent' })
       if (!validName(name)) return json(res, 400, { error: 'invalid item name' })
       const hours = Number(body.get('ttlHours') ?? 0)
       const maxReads = Number(body.get('maxReads') ?? 0)
@@ -2275,6 +2635,7 @@ const server = http.createServer(async (req, res) => {
         oidc: OIDC_ENABLED,
         ntfy: NTFY_URL.length > 0,
         publicUrl: PUBLIC_URL,
+        approvalTokens: (pruneApprovalTokens(), approvalTokens.size),
       })
     }
 
@@ -2333,6 +2694,7 @@ const server = http.createServer(async (req, res) => {
           claims: config.oidc?.claims ?? {},
         },
         ntfyUrl: NTFY_URL,
+        ntfyTokenSet: NTFY_TOKEN.length > 0,
         port: config.port,
         bind: BIND,
         autoUnlock: fs.existsSync(MASTER_PASSWORD_FILE),
@@ -2340,7 +2702,7 @@ const server = http.createServer(async (req, res) => {
         agents: Object.keys(config.agents ?? {}),
         agentWrite: config.agentWrite ?? {},
         profile: { name: config.profile?.name ?? '', email: config.profile?.email ?? '', phone: config.profile?.phone ?? '', avatarUrl: config.profile?.avatarUrl ?? '', totpEnabled: config.profile?.totpEnabled === true, oidcBound: Boolean(config.profile?.oidcSub), oidcEmail: config.profile?.oidcEmail ?? '' },
-        telegram: { configured: Boolean(TELEGRAM_TOKEN && telegramChat()), chatId: telegramChat() },
+        telegram: { configured: Boolean(TELEGRAM_TOKEN && telegramChat() && telegramUser()), chatId: telegramChat(), userId: telegramUser() },
         gotify: { configured: Boolean(GOTIFY_URL && GOTIFY_TOKEN), url: GOTIFY_URL },
         wxpush: { configured: Boolean(WXPUSH_URL && WXPUSH_TOKEN), url: WXPUSH_URL },
       })
@@ -2351,6 +2713,7 @@ const server = http.createServer(async (req, res) => {
       if (typeof body.publicUrl === 'string') config.publicUrl = body.publicUrl.trim().replace(/\/+$/, '')
       if (typeof body.serverUrl === 'string') config.serverUrl = body.serverUrl.trim()
       if (typeof body.ntfyUrl === 'string') config.ntfyUrl = body.ntfyUrl.trim()
+      if (typeof body.ntfyToken === 'string' && body.ntfyToken.trim().length > 0) config.ntfyToken = body.ntfyToken.trim()
       config.oidc ??= {}
       if (typeof body.oidcIssuer === 'string') config.oidc.issuer = body.oidcIssuer.trim().replace(/\/+$/, '')
       if (typeof body.oidcClientId === 'string') config.oidc.clientId = body.oidcClientId.trim()
@@ -2379,8 +2742,10 @@ const server = http.createServer(async (req, res) => {
       ]) {
         if (typeof body[field] === 'string') config.oidc.claims[key] = body[field].trim()
       }
+      config.telegram ??= {}
       if (typeof body.telegramToken === 'string') config.telegram.token = body.telegramToken.trim()
       if (typeof body.telegramChatId === 'string') config.telegram.chatId = body.telegramChatId.trim()
+      if (typeof body.telegramUserId === 'string') config.telegram.userId = body.telegramUserId.trim()
       config.gotify ??= {}
       if (typeof body.gotifyUrl === 'string') config.gotify.url = body.gotifyUrl.trim().replace(/\/+$/, '')
       if (typeof body.gotifyToken === 'string') config.gotify.token = body.gotifyToken.trim()
@@ -2540,6 +2905,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && url.pathname === '/api/pending') {
+      prunePending()
       const requests = [...state.pending.values()]
         .filter((entry) => entry.status === 'pending')
         .map((entry) => ({ id: entry.id, agent: entry.agent, name: entry.name, createdAt: entry.createdAt }))
@@ -2608,9 +2974,10 @@ const server = http.createServer(async (req, res) => {
               return reply({ content: [{ type: 'text', text: items.map((item) => `${item.name}${itemUrl(item) ? ` — ${itemUrl(item)}` : ''}`).join('\n') || '(no items)' }] })
             }
             if (toolName === 'create_secret') {
-              if (config.agentWrite?.[agent] !== true) throw new Error(`agent "${agent}" is not allowed to create items`)
               const name = String(args.name ?? '').trim()
               if (!validName(name)) throw new Error('invalid item name')
+              const writeError = agentWriteError(agent, name)
+              if (writeError) throw new Error(writeError)
               const result = await saveItem(name, String(args.value ?? ''), typeof args.notes === 'string' ? args.notes : undefined, typeof args.url === 'string' ? args.url : undefined)
               config.itemGroups ??= {}
               const group = String(args.group ?? '').trim()
@@ -2624,7 +2991,8 @@ const server = http.createServer(async (req, res) => {
             if (toolName === 'request_access') {
               const name = String(args.name ?? '').trim()
               if (!validName(name)) throw new Error('invalid item name')
-              const entry = await createPending(agent, name)
+              const entry = await createPending(agent, name, { reason: args.reason, command: args.command })
+              if (!entry) throw new Error('too many pending requests')
               return reply({ content: [{ type: 'text', text: `approval required: ${PUBLIC_URL}/ (request ${entry.id})` }] })
             }
             if (toolName === 'get_secret') {
@@ -2632,15 +3000,21 @@ const server = http.createServer(async (req, res) => {
               const name = String(args.name ?? '').trim()
               if (!validName(name)) throw new Error('invalid item name')
               if (!agentAllowed(agent, name)) throw new Error(`agent "${agent}" is not allowed to read "${name}"`)
-              if (validGrant(agent, name) === undefined && config.noApprovalItems?.[name] !== true) throw new Error(`no active grant; call request_access first (${PUBLIC_URL}/)`)
-              const value = await readItemValue(name)
-              const grant = validGrant(agent, name)
-              if (grant !== undefined) {
-                grant.reads = (grant.reads ?? 0) + 1
-                saveGrants()
+              if (config.noApprovalItems?.[name] === true) {
+                const value = await readItemValue(name)
+                audit({ event: 'secret.read', agent, name, mode: 'no-approval', via: 'mcp' })
+                return reply({ content: [{ type: 'text', text: value }] })
               }
-              audit({ event: 'secret.read', agent, name, mode: grant ? 'grant' : 'no-approval', via: 'mcp' })
-              return reply({ content: [{ type: 'text', text: value }] })
+              const grant = reserveGrantRead(agent, name)
+              if (grant === undefined) throw new Error(`no active grant; call request_access first (${PUBLIC_URL}/)`)
+              try {
+                const value = await readItemValue(name)
+                audit({ event: 'secret.read', agent, name, mode: grant.mode, reads: grant.reads, maxReads: grant.maxReads, via: 'mcp' })
+                return reply({ content: [{ type: 'text', text: value }] })
+              } catch (error) {
+                releaseGrantRead(grant)
+                throw error
+              }
             }
             throw new Error(`unknown tool: ${toolName}`)
           } catch (error) {
@@ -2664,7 +3038,6 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { items: items.filter((item) => agentAllowed(agent, item.name)) })
       }
       if (req.method === 'POST' && url.pathname === '/agent/items/save') {
-        if (config.agentWrite?.[agent] !== true) return json(res, 403, { error: `agent "${agent}" is not allowed to create items` })
         const body = await parseBody(req)
         const name = typeof body.name === 'string' ? body.name.trim() : ''
         const value = typeof body.value === 'string' ? body.value : undefined
@@ -2672,6 +3045,8 @@ const server = http.createServer(async (req, res) => {
         const targetUrl = typeof body.url === 'string' ? body.url : undefined
         const group = typeof body.group === 'string' ? body.group.trim() : ''
         if (!validName(name)) return json(res, 400, { error: 'invalid item name' })
+        const writeError = agentWriteError(agent, name)
+        if (writeError) return json(res, 403, { error: writeError })
         try {
           const result = await saveItem(name, value, notes, targetUrl)
           config.itemGroups ??= {}
@@ -2687,17 +3062,32 @@ const server = http.createServer(async (req, res) => {
       }
       const pendingMatch = url.pathname.match(/^\/secret\/pending\/([^/]+)$/)
       if (req.method === 'GET' && pendingMatch) {
+        prunePending()
         const entry = state.pending.get(pendingMatch[1])
         if (entry === undefined || entry.agent !== agent) return json(res, 404, { error: 'unknown request' })
         if (entry.status === 'denied') return json(res, 403, { error: 'request denied' })
         if (!agentAllowed(agent, entry.name)) return json(res, 403, { error: `agent "${agent}" is not allowed to read "${entry.name}"` })
         if (entry.status !== 'approved') return json(res, 202, { status: 'pending', requestId: entry.id })
+        if (entry.mode === 'once') {
+          if (entry.consumed) return json(res, 403, { error: 'approval already used' })
+          entry.consumed = true
+          state.pending.delete(entry.id)
+          try {
+            const value = await readItemValue(entry.name)
+            audit({ event: 'secret.read', agent, name: entry.name, mode: 'once' })
+            return json(res, 200, { value })
+          } catch (error) {
+            return json(res, 502, { error: String(error.message ?? error) })
+          }
+        }
+        const grant = reserveGrantRead(agent, entry.name)
+        if (grant === undefined) return json(res, 403, { error: 'grant is not active' })
         try {
           const value = await readItemValue(entry.name)
-          if (entry.mode === 'once') state.pending.delete(entry.id)
-          audit({ event: 'secret.read', agent, name: entry.name, mode: entry.mode })
+          audit({ event: 'secret.read', agent, name: entry.name, mode: grant.mode, reads: grant.reads, maxReads: grant.maxReads })
           return json(res, 200, { value })
         } catch (error) {
+          releaseGrantRead(grant)
           return json(res, 502, { error: String(error.message ?? error) })
         }
       }
@@ -2720,24 +3110,32 @@ const server = http.createServer(async (req, res) => {
           audit({ event: 'secret.deny', agent, name, mode: 'allowlist' })
           return json(res, 403, { error: `agent "${agent}" is not allowed to read "${name}"` })
         }
-        const grant = validGrant(agent, name)
-        if (grant !== undefined || config.noApprovalItems?.[name] === true) {
+        if (config.noApprovalItems?.[name] === true) {
           try {
             const value = await readItemValue(name)
-            if (grant !== undefined) {
-              grant.reads = (grant.reads ?? 0) + 1
-              saveGrants()
-              audit({ event: 'secret.read', agent, name, mode: grant.mode, reads: grant.reads, maxReads: grant.maxReads })
-            } else {
-              audit({ event: 'secret.read', agent, name, mode: 'no-approval' })
-            }
+            audit({ event: 'secret.read', agent, name, mode: 'no-approval' })
             return json(res, 200, { value })
           } catch (error) {
             return json(res, 502, { error: String(error.message ?? error) })
           }
         }
-        const entry = await createPending(agent, name)
-        return json(res, 202, { status: 'pending', requestId: entry.id, approveUrl: `http://127.0.0.1:${config.port}/` })
+        const grant = reserveGrantRead(agent, name)
+        if (grant !== undefined) {
+          try {
+            const value = await readItemValue(name)
+            audit({ event: 'secret.read', agent, name, mode: grant.mode, reads: grant.reads, maxReads: grant.maxReads })
+            return json(res, 200, { value })
+          } catch (error) {
+            releaseGrantRead(grant)
+            return json(res, 502, { error: String(error.message ?? error) })
+          }
+        }
+        const entry = await createPending(agent, name, {
+          reason: url.searchParams.get('reason') ?? '',
+          command: url.searchParams.get('command') ?? '',
+        })
+        if (!entry) return json(res, 429, { error: 'too many pending requests' })
+        return json(res, 202, { status: 'pending', requestId: entry.id, approveUrl: `${PUBLIC_URL}/` })
       }
     }
 
@@ -2747,10 +3145,15 @@ const server = http.createServer(async (req, res) => {
   }
 })
 
+assertSafeBind()
+if (!keyMaterialOutsideDataDir()) {
+  console.error('[secrets-broker] warning: the encryption key is inside the data directory. Set SECRETS_BROKER_ENCRYPTION_KEY or SECRETS_BROKER_KEY_FILE to a Docker secret or a file outside the data volume. On-disk auto-unlock stays disabled until the key is separate from master-password.')
+}
 server.listen(config.port, BIND, () => {
   console.log(`[secrets-broker] listening on http://${BIND}:${config.port}${MOCK ? ' (MOCK)' : ''}`)
   console.log(`[secrets-broker] dashboard: http://${BIND === '0.0.0.0' ? '127.0.0.1' : BIND}:${config.port}/`)
-  console.log(`[secrets-broker] admin auth: ${AUTH_REQUIRED ? 'password required' : 'local-only (no password set)'}`)
+  console.log(`[secrets-broker] bind: ${BIND} (loopback 127.0.0.1 outside containers; 0.0.0.0 inside Docker so published ports can connect)`)
+  console.log(`[secrets-broker] admin auth: ${AUTH_REQUIRED ? 'password required' : 'disabled until SECRETS_BROKER_ADMIN_PASSWORD is set'}`)
   console.log(`[secrets-broker] bw entry: ${config.bwJs}`)
   console.log(`[secrets-broker] agents: ${Object.keys(config.agents ?? {}).join(', ')}`)
 
@@ -2767,8 +3170,9 @@ server.listen(config.port, BIND, () => {
 
   if (TELEGRAM_TOKEN) {
     console.log('[secrets-broker] telegram bot polling enabled')
+    const pollMs = Math.max(50, Number(process.env.SECRETS_BROKER_TELEGRAM_POLL_MS ?? 2500) || 2500)
     setInterval(() => {
       telegramPoll().catch(() => {})
-    }, 2500)
+    }, pollMs)
   }
 })

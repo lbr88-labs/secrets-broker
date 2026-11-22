@@ -11,6 +11,10 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 mkdir -p deploy data
+# The image runs as uid 1000. A root-owned data directory cannot be written.
+if [ "$(id -u)" -eq 0 ]; then
+  chown 1000:1000 data || true
+fi
 
 if [ ! -f deploy/.env ]; then
   echo "Secrets Broker setup"

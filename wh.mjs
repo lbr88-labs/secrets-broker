@@ -17,7 +17,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { spawn } from 'node:child_process'
+import { accessHeaders, childEnv, createRedactor, spawnUserCommand } from './redact.mjs'
 
 const baseUrl = (process.env.SECRETS_BROKER_URL ?? 'http://127.0.0.1:8788').replace(/\/+$/, '')
 const brokerHome = process.env.SECRETS_BROKER_HOME ?? path.join(os.homedir(), '.secrets-broker')
@@ -26,7 +26,8 @@ let token = process.env.SECRETS_BROKER_TOKEN ?? ''
 if (!token && agentName) {
   try {
     const config = JSON.parse(fs.readFileSync(path.join(brokerHome, 'config.json'), 'utf8').replace(/^\uFEFF/, ''))
-    token = config?.agents?.[agentName] ?? ''
+    const stored = config?.agents?.[agentName] ?? ''
+    if (typeof stored === 'string' && stored.length > 0 && !stored.startsWith('sha256:')) token = stored
   } catch {
     token = ''
   }
@@ -43,7 +44,7 @@ function requireToken() {
 }
 
 async function request(pathname) {
-  const response = await fetch(`${baseUrl}${pathname}`, { headers: { authorization: `Bearer ${token}` } })
+  const response = await fetch(`${baseUrl}${pathname}`, { headers: accessHeaders({ authorization: `Bearer ${token}` }) })
   const payload = await response.json().catch(() => ({}))
   return { status: response.status, payload }
 }
@@ -104,8 +105,23 @@ if (mode === 'get') {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(entry.envName)) fail(`invalid env name "${entry.envName}"`)
     injected[entry.envName] = await fetchSecret(entry.item)
   }
-  const child = spawn(command, commandArgs, { stdio: 'inherit', env: { ...process.env, ...injected } })
-  child.on('exit', (code, signal) => {
+  const secrets = Object.values(injected)
+  const stdoutRedactor = createRedactor(secrets)
+  const stderrRedactor = createRedactor(secrets)
+  const child = spawnUserCommand(command, commandArgs, childEnv(process.env, injected))
+  child.stdout.on('data', (chunk) => {
+    const text = stdoutRedactor.push(chunk.toString())
+    if (text) process.stdout.write(text)
+  })
+  child.stderr.on('data', (chunk) => {
+    const text = stderrRedactor.push(chunk.toString())
+    if (text) process.stderr.write(text)
+  })
+  child.on('close', (code, signal) => {
+    const out = stdoutRedactor.flush()
+    const err = stderrRedactor.flush()
+    if (out) process.stdout.write(out)
+    if (err) process.stderr.write(err)
     if (signal) process.kill(process.pid, signal)
     process.exit(code ?? 0)
   })

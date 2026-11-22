@@ -11,6 +11,7 @@
   "scripts": {
     "start": "node server.mjs",
     "mcp": "node mcp-server.mjs",
-    "helper": "node wh.mjs"
+    "helper": "node wh.mjs",
+    "test": "node --test --test-timeout 30000 test/*.test.mjs"
   }
 }

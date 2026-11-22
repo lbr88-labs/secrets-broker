@@ -79,7 +79,7 @@ demo resets itself, so poke at whatever you like.
 ## Quick start (Docker)
 
 ```bash
-git clone https://github.com/otscup/secrets-broker.git
+git clone https://github.com/lbr88-labs/secrets-broker.git
 cd secrets-broker
 ./deploy/install.sh
 ```
@@ -100,9 +100,16 @@ cp deploy/.env.example deploy/.env
 docker compose up -d --build
 ```
 
-Open `http://<host>:8788/`, log in with `SECRETS_BROKER_ADMIN_PASSWORD`, then enter
-your vault master password to unlock. Alternatively put the master password in
-`data/master-password` (encrypted automatically on first start) for auto-unlock.
+Open `http://127.0.0.1:8788/`, log in with `SECRETS_BROKER_ADMIN_PASSWORD`, then
+enter your vault master password to unlock. The published port is loopback-only.
+Inside the container the process listens on `0.0.0.0` so that mapping works, and
+it runs as the `node` user (uid 1000). `data/` must be writable by that user.
+
+Do not leave a `master-password` file next to `encryption.key`. On-disk
+auto-unlock is refused while the key lives in the data directory. Unlock with
+`SECRETS_BROKER_MASTER_PASSWORD`, or move the key to `SECRETS_BROKER_ENCRYPTION_KEY`
+/ `SECRETS_BROKER_KEY_FILE` (a Docker secret or a path outside the volume) before
+using the file.
 
 Data lives in `data/` (mounted as `/data` in the container): `config.json`,
 `grants.json`, `audit.log`, `encryption.key`, optional `master-password` and the
@@ -177,18 +184,79 @@ Tools: `list_secrets`, `create_secret`, `request_access`, and optional `get_secr
 ```
 
 The stdio adapter adds `exec_with_secrets`, which injects secrets into a local child
-process environment so the model only sees command output.
+process environment. Returned stdout and stderr have the secret and its base64,
+base64url, URL-encoded and hex forms replaced with `[redacted]`, including when
+the value is split across writes. `wh.mjs` does the same. The command's parent
+process is started without `BROKER_AGENT_TOKEN`, `SECRETS_BROKER_TOKEN`, the
+Cloudflare Access service token, or the admin, master and encryption-key
+variables, so `/proc/$PPID/environ` does not contain them.
+
+That masking is a guard against accidents. A command can still print a prefix,
+a reversed or spaced value, or an encoding of the value plus extra text. The
+helper that launched the parent still has the original environment, and the
+token is also in the harness MCP config and in the helper's memory. Set
+`BROKER_AGENT_TOKEN` explicitly; a stored `sha256:` hash is not used as a bearer
+token.
 
 ## Notifications
 
 All optional. Configure in the UI (Settings) or via environment:
 
-- **ntfy**: topic URL; approval message contains signed one-time links.
-- **Telegram**: bot token + chat id. The bot sends inline buttons (approve once / 1h /
-  24h / 7d / permanent / deny); callbacks are handled by long polling.
+- **ntfy**: private topic URL plus `NTFY_TOKEN`. The push carries `http` POST action buttons, not links in the body.
+- **Telegram**: bot token, chat id and user id. Both ids must be configured. The bot sends inline buttons (approve once / 1h / 24h / 7d / permanent / deny); callbacks are handled by long polling and ignored unless `from.id` and `message.chat.id` match.
 - **Gotify**: server URL + app token.
 - **wxpush**: `WXPUSH_URL` + API token; sends WeChat notifications via
   [wxpush](https://github.com/frankiejun/wxpush).
+
+## Secure deployment
+
+Use this shape for a pilot. The defaults now match it: OAuth is off, a new
+install creates no agents, and an empty allow-list matches nothing.
+
+- Leave OIDC unset. Leave OAuth unset (`SECRETS_BROKER_OAUTH` is not `1`, and
+  `config.oauthEnabled` is not `true`). Dynamic client registration stays off
+  unless OAuth is on, `SECRETS_BROKER_OAUTH_REGISTRATION=1`, and the request
+  carries an admin session cookie.
+- Leave `MCP_ALLOW_READ` unset. `get_secret` returns the value to the model.
+- Do not enable on-disk auto-unlock. `autoImport` now defaults to false, so
+  unlock does not write the author's local credential files into the vault.
+  An existing config that sets `"autoImport": true` still imports.
+- Put Cloudflare Access in front of the public hostname. Give each harness its
+  own Access service token and set `CF_ACCESS_CLIENT_ID` and
+  `CF_ACCESS_CLIENT_SECRET` on `mcp-server.mjs` and `wh.mjs`. Those two headers
+  are added only when both variables are set. Keep a separate agent token per
+  harness as well.
+- Bypass Access for `POST /approve/*` only. ntfy action buttons are HTTP POSTs
+  from the ntfy app and do not send an Access cookie or service token. The POST
+  is still gated by a one-time bearer token. Keep `GET /approve/*` and every
+  other path behind Access. Do not put the whole `/approve/` prefix behind
+  Access, or the phone buttons stop working.
+- If a tunnel reaches a process that is bound to `127.0.0.1`, set
+  `SECRETS_BROKER_BEHIND_PROXY=1`. A non-loopback `BROKER_PUBLIC_URL` is treated
+  the same way. Either one, or a non-loopback bind, refuses to start unless
+  `SECRETS_BROKER_ADMIN_PASSWORD` is set.
+- Run ntfy yourself. ACL the topic so only your user can read it and only the
+  broker's token can write it, and set `NTFY_TOKEN` (or the token field in
+  Settings). The one-time approval tokens sit in the ntfy `Actions` header, so
+  anyone who can read the topic can approve for about 10 minutes. Approvals are
+  `http` POST buttons. The message body does not contain an `/approve/` URL.
+  The bot-supplied reason and command are below an untrusted-text label.
+  Opening the signed link in a browser shows a confirm form; the decision is a
+  `POST`. Configure Telegram with both `TELEGRAM_CHAT_ID` and
+  `TELEGRAM_USER_ID`. Incoming messages never change those ids.
+- Give every agent an allow-list (`*` means every item). An empty list is no
+  access, including writes. The UI checkbox "全部条目" saves `*`.
+
+The admin cookie is `HttpOnly` and `SameSite=Strict`, one random id per login,
+and it is deleted on logout. `Secure` is added when `BROKER_PUBLIC_URL` is
+`https://` (or the request is HTTPS). On plain `http://127.0.0.1` it is omitted
+so a browser can keep the session; set `SECRETS_BROKER_COOKIE_SECURE=1` to force
+it. `/login` and `/oauth/approve` have separate per-IP lockouts (5 failures, then
+5 minutes). A tunnel that shows every client as one address can still lock that
+one form. A bot can have at most 5 pending approval requests at a time.
+
+Default listen address outside Docker is `127.0.0.1`. The image listens on
+`0.0.0.0` and Compose publishes `127.0.0.1:8788:8788`.
 
 ## Security model (summary)
 
@@ -196,9 +264,9 @@ All optional. Configure in the UI (Settings) or via environment:
   AES-256-GCM encrypted on disk.
 - Agent tokens: SHA-256 hashes in config; plaintext only in the encrypted
   `agent-tokens.json` (for copy/rotate) — or use environment variables instead.
-- Admin page: password (optional TOTP) or OIDC, login throttling, HttpOnly cookie.
-- Every read is authorized by an active grant or an explicit approval, then audited.
-- Approval links are HMAC-signed with an expiry.
+- Admin page: password plus TOTP when TOTP is enabled. OIDC only for the bound subject. Login throttling. `HttpOnly` `SameSite=Strict` session cookie.
+- Every read is authorized by an active grant or a not-yet-consumed `once` approval, then audited. Revoke and expiry apply to an old request id.
+- ntfy approvals are one-time `POST` actions. A signed `GET` only shows a confirm form.
 - This is a self-hosted tool: run it behind a private network or a tunnel/Access
   policy; do not expose port 8788 directly.
 
@@ -209,12 +277,16 @@ Main environment variables:
 | Variable | Meaning |
 |---|---|
 | `SECRETS_BROKER_HOME` | data directory (default `~/.secrets-broker`) |
-| `SECRETS_BROKER_PORT` / `SECRETS_BROKER_BIND` | listen port/address |
+| `SECRETS_BROKER_PORT` / `SECRETS_BROKER_BIND` | listen port/address (default `127.0.0.1`; `0.0.0.0` in the image) |
 | `SECRETS_BROKER_ADMIN_PASSWORD` | admin login password |
-| `BROKER_PUBLIC_URL` | public URL for links/OAuth metadata |
+| `SECRETS_BROKER_BEHIND_PROXY` | set to `1` when a tunnel reaches a loopback bind |
+| `BROKER_PUBLIC_URL` | public URL for approval actions and OAuth metadata |
 | `SECRETS_BROKER_BW` | `bw` binary or path to `bw.js` |
-| `SECRETS_BROKER_ENCRYPTION_KEY` | optional 32-byte base64 key (default key file) |
-| `MCP_ALLOW_READ` | expose `get_secret` over MCP |
+| `SECRETS_BROKER_ENCRYPTION_KEY` / `SECRETS_BROKER_KEY_FILE` | 32-byte base64 key, or a key file outside the data directory |
+| `SECRETS_BROKER_OAUTH` / `SECRETS_BROKER_OAUTH_REGISTRATION` | both off by default |
+| `NTFY_TOKEN`, `TELEGRAM_CHAT_ID`, `TELEGRAM_USER_ID` | private ntfy topic and the bound Telegram owner |
+| `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` | Cloudflare Access service token for the stdio adapter and `wh.mjs` |
+| `MCP_ALLOW_READ` | expose `get_secret` over MCP; leave unset |
 
 Most other settings (vault URL, OIDC, notification providers, public URL) can be
 edited in the UI and are persisted to `config.json`.
