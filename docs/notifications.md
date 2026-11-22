@@ -6,21 +6,29 @@ broker sends the same approval message to every configured channel.
 
 ## ntfy
 
-Set `NTFY_URL` to a topic URL, e.g. `https://ntfy.example.com/secrets-broker`.
-The notification body contains HMAC-signed, 10-minute approval links for
-"allow once", "allow 24h" and "deny" — clicking one approves without opening the
-admin page.
+Set `NTFY_URL` to a **private** topic on a server you control, for example
+`https://ntfy.example.com/secrets-broker`, and set `NTFY_TOKEN` to that topic's
+access token. The broker sends `Authorization: Bearer <token>`.
+
+The message body names the bot, the secret, the duration and the command, then
+a separate line for the bot-supplied reason (capped at 120 characters). It does
+not contain an `/approve/` URL. Allow once, 1h, 24h and deny are ntfy `http`
+action buttons: each is a `POST` carrying a one-time bearer token that the
+broker deletes when it is used.
 
 ## Telegram
 
 1. Create a bot with [@BotFather](https://t.me/BotFather).
-2. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` (or save them in Settings).
-3. Send `/start` to the bot once; the broker can also learn the chat id from an
-   incoming message.
+2. Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` and `TELEGRAM_USER_ID` (or save
+   all three in Settings). Approvals are ignored until both the chat id and the
+   user id are set.
+3. The broker never learns those ids from an incoming message. `/start` from
+   another chat does not move the approval channel.
 
 Approval messages contain inline buttons (once / 1h / 24h / 7d / permanent /
-deny). The broker handles callbacks with long polling, so no public webhook is
-required.
+deny). A callback is accepted only when `from.id` equals the configured user
+and `message.chat.id` equals the configured chat. The broker handles callbacks
+with long polling, so no public webhook is required.
 
 ## Gotify
 
@@ -36,13 +44,14 @@ Set `WXPUSH_URL` (e.g. `https://wxpush.example.com`) and `WXPUSH_TOKEN`. The
 broker posts form fields `title`, `content` and `token` to `/wxsend` with the
 token in the `Authorization` header.
 
-## Signed approval links
+## Confirm step
 
-Every notification contains links of the form:
+`GET /approve/<request-id>?d=once&exp=<timestamp>&sig=<hmac>` shows a confirm
+form and does not decide. The form posts the same HMAC fields. `d` can be
+`once`, `1h`, `24h`, `7d`, `always` or `deny`. The signature expires after 10
+minutes and a request can only be decided once.
 
-```
-/approve/<request-id>?d=once&exp=<timestamp>&sig=<hmac>
-```
-
-They are signed with the broker session secret and expire after 10 minutes.
-`d` can be `once`, `1h`, `24h`, `7d`, `always` or `deny`.
+ntfy buttons do not use that URL. They `POST` to `/approve/<id>` with
+`Authorization: Bearer <one-time token>`. Gotify and wxpush receive the same
+text as ntfy and no capability URL; approve those requests from the admin page
+or from Telegram.

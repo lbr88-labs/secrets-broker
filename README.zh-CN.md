@@ -121,10 +121,24 @@ https://broker.example.com/mcp
 
 在「设置」或环境变量中配置，均为可选：
 
-- **ntfy**：通知里带签名的「允许一次 / 24 小时 / 拒绝」链接；
-- **Telegram**：内联按钮直接审批（broker 用长轮询处理，不需要公网 webhook）；
+- **ntfy**：私有主题加 `NTFY_TOKEN`。审批是 ntfy 的 `http` POST 按钮，正文里没有 `/approve/` 链接；
+- **Telegram**：必须同时配置 Chat ID 和 User ID。别人发 `/start` 不会改绑定；回调必须来自这两个 id；
 - **Gotify**：Gotify URL + App Token；
 - **wxpush**：`WXPUSH_URL` + API Token，推送到微信。
+
+## 安全部署
+
+试点按这个用。OAuth 默认关闭，新安装不会创建 `dsh` / `codex` / `hermes`，空的 allow-list 表示没有任何权限。
+
+- 不配置 OIDC，不打开 OAuth（`SECRETS_BROKER_OAUTH` 不要设为 `1`）。`MCP_ALLOW_READ` 保持未设置。
+- 不要把主密码文件和 `encryption.key` 放在同一个数据目录。密钥在数据目录里时，磁盘上的自动解锁会被拒绝。用 `SECRETS_BROKER_MASTER_PASSWORD`，或把密钥放到 `SECRETS_BROKER_ENCRYPTION_KEY` / `SECRETS_BROKER_KEY_FILE`。
+- 在 `config.json` 里设 `"autoImport": false`。
+- 公网主机名（含 `/approve/`）放在 Cloudflare Access 后面。每个 harness 单独的 Access service token，设 `CF_ACCESS_CLIENT_ID` 和 `CF_ACCESS_CLIENT_SECRET`，再加各自的 agent token。
+- 隧道打到本机时设 `SECRETS_BROKER_BEHIND_PROXY=1`。`BROKER_PUBLIC_URL` 不是本机地址时同样必须有管理密码。
+- ntfy 用自己的私有主题和 `NTFY_TOKEN`。Telegram 同时填 chat id 和 user id。
+- 每个 agent 都要有 allow-list。空列表不能读也不能写；`*` 才是全部条目。
+
+管理 cookie 每次登录都是新的随机 id，退出后失效，`HttpOnly`、`SameSite=Strict`。公网 URL 是 `https://` 时带 `Secure`；纯 `http://127.0.0.1` 不带，否则浏览器存不住。容器内监听 `0.0.0.0`，Compose 只把 `127.0.0.1:8788` 映到主机。进程以 uid 1000 运行，数据目录需要这个用户可写。
 
 ## 安全模型
 

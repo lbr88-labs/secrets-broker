@@ -10,15 +10,24 @@ https://<your-broker>/mcp
 
 Two authentication modes are supported:
 
-### OAuth 2.1 (recommended)
+### OAuth 2.1 (off by default)
 
-Clients that implement MCP authorization discover the broker automatically:
+OAuth stays off until `SECRETS_BROKER_OAUTH=1` (or `config.oauthEnabled`).
+Prefer a static agent token. When OAuth is on, dynamic registration also
+requires `SECRETS_BROKER_OAUTH_REGISTRATION=1` and an admin session cookie on
+`POST /oauth/register`. A new client can read nothing until an admin sets its
+allow-list. Deleting the `oauth:<client_id>` agent revokes the client.
+
+`/oauth/approve` asks for the admin password and, if TOTP is enabled, the
+current code. An existing admin cookie is not accepted on its own.
+
+Clients that implement MCP authorization then discover the broker:
 
 1. request `/mcp` without a token → `401` with
    `WWW-Authenticate: Bearer resource_metadata=".../​.well-known/oauth-protected-resource"`;
 2. read `/.well-known/oauth-protected-resource` and
    `/.well-known/oauth-authorization-server`;
-3. register a client with `POST /oauth/register` (dynamic client registration);
+3. register a client with `POST /oauth/register` from an admin session (dynamic registration is not anonymous);
 4. open `/oauth/authorize` in a browser — the user logs in to the broker if needed
    and clicks **Allow**;
 5. exchange the code at `POST /oauth/token` with PKCE S256;
@@ -69,4 +78,20 @@ model, or the stdio adapter's `exec_with_secrets`.
 ```
 
 The stdio adapter additionally provides `exec_with_secrets`, which injects
-secrets into a child process environment and returns only the command output.
+secrets into a child process environment. The result masks the secret value and
+its base64, base64url and URL-encoded forms. The child environment does not
+include `BROKER_AGENT_TOKEN`, `SECRETS_BROKER_TOKEN`, the Cloudflare Access
+service token, or the admin, master and encryption-key variables.
+
+Add the Access service token next to the agent token when the broker is behind
+Cloudflare Access:
+
+```json
+"CF_ACCESS_CLIENT_ID": "<access client id>",
+"CF_ACCESS_CLIENT_SECRET": "<access client secret>"
+```
+
+`wh.mjs` reads the same two variables, plus `SECRETS_BROKER_URL` and
+`SECRETS_BROKER_TOKEN`. Do not point `BROKER_AGENT` at a name and expect the
+adapter to reuse `config.agents`: that field is a `sha256:` hash, and a hash is
+never sent as a bearer token.

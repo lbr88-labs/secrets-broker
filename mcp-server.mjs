@@ -19,6 +19,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { spawn } from 'node:child_process'
+import { accessHeaders, childEnv, redactSecrets } from './redact.mjs'
 
 const BROKER_URL = (process.env.BROKER_URL ?? 'http://127.0.0.1:8788').replace(/\/+$/, '')
 const CONFIG_PATH = process.env.BROKER_CONFIG ?? path.join(os.homedir(), '.secrets-broker', 'config.json')
@@ -26,11 +27,11 @@ const ALLOW_READ = process.env.MCP_ALLOW_READ === '1'
 const WAIT_MS = Number(process.env.MCP_APPROVAL_WAIT_SEC ?? 90) * 1000
 
 let token = process.env.BROKER_AGENT_TOKEN ?? ''
-if (!token) {
-  const agent = process.env.BROKER_AGENT ?? 'dsh'
+if (!token && process.env.BROKER_AGENT) {
   try {
     const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8').replace(/^\uFEFF/, ''))
-    token = config?.agents?.[agent] ?? ''
+    const stored = config?.agents?.[process.env.BROKER_AGENT] ?? ''
+    if (typeof stored === 'string' && stored.length > 0 && !stored.startsWith('sha256:')) token = stored
   } catch {
     token = ''
   }
@@ -46,10 +47,10 @@ function log(...args) {
 async function broker(path, { method = 'GET', body } = {}) {
   const response = await fetch(`${BROKER_URL}${path}`, {
     method,
-    headers: {
+    headers: accessHeaders({
       authorization: `Bearer ${token}`,
       ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-    },
+    }),
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   const payload = await response.json().catch(() => ({}))
@@ -145,8 +146,9 @@ async function callTool(name, args = {}) {
     for (const [envName, itemName] of Object.entries(vars)) {
       injected[envName] = (await readSecret(itemName)).value
     }
+    const secrets = Object.values(injected)
     const child = spawn(args.command, args.args ?? [], {
-      env: { ...process.env, ...injected },
+      env: childEnv(process.env, injected),
       stdio: ['ignore', 'pipe', 'pipe'],
     })
     let stdout = ''
@@ -154,7 +156,9 @@ async function callTool(name, args = {}) {
     child.stdout.on('data', (chunk) => { stdout += chunk })
     child.stderr.on('data', (chunk) => { stderr += chunk })
     const code = await new Promise((resolve) => child.on('close', resolve))
-    return `exit=${code}\n${stdout}${stderr ? `\n[stderr]\n${stderr}` : ''}`
+    const out = redactSecrets(stdout, secrets)
+    const err = redactSecrets(stderr, secrets)
+    return `exit=${code}\n${out}${err ? `\n[stderr]\n${err}` : ''}`
   }
   throw new Error(`unknown tool: ${name}`)
 }

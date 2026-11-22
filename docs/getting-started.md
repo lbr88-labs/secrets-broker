@@ -10,7 +10,7 @@
 ## One-command Docker install
 
 ```bash
-git clone https://github.com/otscup/secrets-broker.git
+git clone https://github.com/lbr88-labs/secrets-broker.git
 cd secrets-broker
 ./deploy/install.sh
 ```
@@ -29,8 +29,10 @@ cp deploy/.env.example deploy/.env
 docker compose up -d --build
 ```
 
-Data is stored in `data/` (mounted at `/data`): configuration, grants, audit log,
-encryption key and optionally the auto-unlock password.
+Data is stored in `data/` (mounted at `/data`): configuration, grants and the
+audit log. The container runs as uid 1000; `chown 1000:1000 data` if that
+directory is owned by root. Keep the encryption key outside this directory.
+See the README section **Secure deployment**.
 
 ## Local run (no Docker)
 
@@ -53,7 +55,9 @@ Requires the `bw` CLI on PATH (or `SECRETS_BROKER_BW` pointing at
 
 ## Exposing it safely
 
-Do not publish port 8788 to the internet. Put the broker behind a private
-network (Tailscale/WireGuard) or a tunnel with an access policy. Set
-`BROKER_PUBLIC_URL` to the URL users see; it is used in approval links and OAuth
-metadata.
+Do not publish port 8788 to the internet. Compose already binds
+`127.0.0.1:8788:8788`. The process inside the container listens on `0.0.0.0`
+so that publish works; a local `npm start` listens on `127.0.0.1`. Put a
+tunnel with an access policy in front if phones or harnesses are remote, and
+set `SECRETS_BROKER_BEHIND_PROXY=1` when that tunnel hits loopback. Set
+`BROKER_PUBLIC_URL` to the URL users see.

@@ -18,6 +18,9 @@ jobs:
           node --check server.mjs
           node --check mcp-server.mjs
           node --check wh.mjs
+          node --check redact.mjs
+      - name: Tests
+        run: npm test
 
   docker:
     runs-on: ubuntu-latest
