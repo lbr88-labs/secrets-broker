@@ -133,10 +133,26 @@ function saveAgentTokens(tokens) {
   }
   writePrivate(AGENT_TOKENS_PATH, JSON.stringify(encrypted, null, 2))
 }
+function isOauthPlaceholder(value) {
+  return value === 'oauth' || value === hashToken('oauth')
+}
 function migrateAgentTokens() {
   const tokens = loadAgentTokens()
   let changed = false
   for (const [name, value] of Object.entries(config.agents ?? {})) {
+    // OAuth agents are not bearer-token accounts. A stored 'oauth' placeholder,
+    // or the hash migration made of that placeholder, must never authenticate.
+    if (name.startsWith('oauth:') || isOauthPlaceholder(value)) {
+      if (config.agents[name] !== null) {
+        config.agents[name] = null
+        changed = true
+      }
+      if (Object.prototype.hasOwnProperty.call(tokens, name)) {
+        delete tokens[name]
+        changed = true
+      }
+      continue
+    }
     if (typeof value === 'string' && !value.startsWith('sha256:') && value.length > 0) {
       tokens[name] = value
       config.agents[name] = hashToken(value)
@@ -174,22 +190,26 @@ function readAutoUnlockPassword() {
   return raw
 }
 
-function loginThrottle(req) {
-  const ip = req.socket?.remoteAddress ?? 'unknown'
-  const entry = loginFailures.get(ip)
-  if (entry === undefined) return { ip, blocked: false, count: 0 }
-  if (entry.blockedUntil && entry.blockedUntil > Date.now()) return { ip, blocked: true, count: entry.count }
-  if (entry.firstAt < Date.now() - 10 * 60 * 1000) {
-    loginFailures.delete(ip)
-    return { ip, blocked: false, count: 0 }
-  }
-  return { ip, blocked: false, count: entry.count }
+function clientIp(req) {
+  return req.socket?.remoteAddress ?? 'unknown'
 }
-function recordLoginFailure(ip) {
-  const entry = loginFailures.get(ip) ?? { count: 0, firstAt: Date.now(), blockedUntil: 0 }
+function loginThrottle(req, bucket) {
+  const ip = clientIp(req)
+  const key = `${bucket}:${ip}`
+  const entry = loginFailures.get(key)
+  if (entry === undefined) return { ip, key, blocked: false, count: 0 }
+  if (entry.blockedUntil && entry.blockedUntil > Date.now()) return { ip, key, blocked: true, count: entry.count }
+  if (entry.firstAt < Date.now() - 10 * 60 * 1000) {
+    loginFailures.delete(key)
+    return { ip, key, blocked: false, count: 0 }
+  }
+  return { ip, key, blocked: false, count: entry.count }
+}
+function recordLoginFailure(key) {
+  const entry = loginFailures.get(key) ?? { count: 0, firstAt: Date.now(), blockedUntil: 0 }
   entry.count += 1
   if (entry.count >= 5) entry.blockedUntil = Date.now() + 5 * 60 * 1000
-  loginFailures.set(ip, entry)
+  loginFailures.set(key, entry)
 }
 
 function loadConfig() {
@@ -209,7 +229,7 @@ function loadConfig() {
     parsed.agentAliases ??= {}
     parsed.port ??= 8788
     parsed.bwJs ??= BW_JS
-    parsed.autoImport ??= true
+    parsed.autoImport ??= false
     if (parsed.oidc?.clientSecret && isEncrypted(parsed.oidc.clientSecret)) {
       parsed.oidc.clientSecret = decryptString(parsed.oidc.clientSecret)
     }
@@ -233,7 +253,7 @@ function loadConfig() {
     port: Number(process.env.SECRETS_BROKER_PORT ?? 8788),
     serverUrl: 'https://vault.example.com',
     bwJs: BW_JS,
-    autoImport: true,
+    autoImport: false,
     agents: {},
     oauthEnabled: false,
     oauthAllowRegistration: false,
@@ -1415,14 +1435,11 @@ function agentFromRequest(req) {
     return `oauth:${oauth.clientId}`
   }
   for (const [agent, value] of Object.entries(config.agents ?? {})) {
-    if (typeof value !== 'string' || value.length === 0) continue
-    if (value.startsWith('sha256:')) {
-      const a = Buffer.from(value)
-      const b = Buffer.from(presented)
-      if (a.length === b.length && crypto.timingSafeEqual(a, b)) return agent
-    } else if (value === token) {
-      return agent
-    }
+    if (agent.startsWith('oauth:')) continue
+    if (typeof value !== 'string' || !value.startsWith('sha256:') || isOauthPlaceholder(value)) continue
+    const a = Buffer.from(value)
+    const b = Buffer.from(presented)
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) return agent
   }
   return undefined
 }
@@ -1462,7 +1479,7 @@ function oauthRegistrationEnabled() {
 function ensureOauthAgent(clientId) {
   const name = `oauth:${clientId}`
   config.agents ??= {}
-  if (!config.agents[name]) config.agents[name] = 'oauth'
+  config.agents[name] = null
   config.agentAccess ??= {}
   if (!Array.isArray(config.agentAccess[name])) config.agentAccess[name] = []
   return name
@@ -1652,18 +1669,28 @@ function clipUntrusted(value) {
     .trim()
     .slice(0, UNTRUSTED_TEXT_LIMIT)
 }
+const PENDING_PER_AGENT = 5
 function prunePending() {
   const ttl = pendingTtl()
   const now = Date.now()
   for (const [id, entry] of state.pending) {
     if (now - entry.createdAt > ttl) state.pending.delete(id)
   }
+  pruneApprovalTokens()
+}
+function pendingCount(agent) {
+  let count = 0
+  for (const entry of state.pending.values()) {
+    if (entry.agent === agent && entry.status === 'pending') count += 1
+  }
+  return count
 }
 async function createPending(agent, name, extra = {}) {
   prunePending()
   for (const entry of state.pending.values()) {
     if (entry.agent === agent && entry.name === name && entry.status === 'pending') return entry
   }
+  if (pendingCount(agent) >= PENDING_PER_AGENT) return undefined
   const entry = {
     id: crypto.randomUUID(),
     agent,
@@ -1680,16 +1707,17 @@ async function createPending(agent, name, extra = {}) {
 }
 
 function approvalMessage(entry) {
-  return [
+  const lines = [
     'Secrets Broker approval',
     `Bot: ${entry.agent}`,
     `Secret: ${clipUntrusted(entry.name)}`,
-    `Command: ${entry.command || '(none)'}`,
     'Duration: choose an action (once, 1 hour, 24 hours, or deny).',
     '',
-    'Untrusted reason from the bot:',
-    entry.reason || '(none)',
-  ].join('\n')
+    'Untrusted text from the bot (not checked by the broker):',
+    `Reason: ${entry.reason || '(none)'}`,
+  ]
+  if (entry.command) lines.push(`Command: ${entry.command}`)
+  return lines.join('\n')
 }
 
 /** Optional push notification (ntfy) when a new approval request appears. */
@@ -1754,12 +1782,24 @@ function approvalUrl(id, decision, ttlMs = 10 * 60 * 1000) {
   return `${PUBLIC_URL}/approve/${encodeURIComponent(id)}?d=${encodeURIComponent(decision)}&exp=${exp}&sig=${sig}`
 }
 const approvalTokens = new Map()
+function approvalTokenTtl() {
+  const value = Number(process.env.SECRETS_BROKER_APPROVAL_TOKEN_TTL_MS ?? 10 * 60 * 1000)
+  return Number.isFinite(value) && value > 0 ? value : 10 * 60 * 1000
+}
+function pruneApprovalTokens() {
+  const now = Date.now()
+  for (const [token, entry] of approvalTokens) {
+    if (!entry || entry.exp <= now) approvalTokens.delete(token)
+  }
+}
 function issueApprovalToken(id, decision) {
+  pruneApprovalTokens()
   const token = crypto.randomBytes(32).toString('base64url')
-  approvalTokens.set(token, { id, decision, exp: Date.now() + 10 * 60 * 1000 })
+  approvalTokens.set(token, { id, decision, exp: Date.now() + approvalTokenTtl() })
   return token
 }
 function takeApprovalToken(token) {
+  pruneApprovalTokens()
   if (!token) return undefined
   const entry = approvalTokens.get(token)
   if (!entry) return undefined
@@ -2226,7 +2266,7 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'POST' && url.pathname === '/oauth/approve') {
     if (!oauthEnabled()) return json(res, 404, { error: 'oauth_disabled' })
-    const throttle = loginThrottle(req)
+    const throttle = loginThrottle(req, 'oauth')
     if (throttle.blocked) {
       audit({ event: 'oauth.approve-blocked', ip: throttle.ip })
       res.writeHead(429, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
@@ -2240,11 +2280,11 @@ const server = http.createServer(async (req, res) => {
     const passwordOk = passwordMatches(body.password)
     const totpOk = config.profile?.totpEnabled !== true || verifyTotp(config.profile.totpSecret, String(body.code ?? ''))
     if (!passwordOk || !totpOk) {
-      recordLoginFailure(throttle.ip)
+      recordLoginFailure(throttle.key)
       audit({ event: 'oauth.approve-fail', ip: throttle.ip })
       return html(res, oauthConsentPage(params, client, '密码或验证码错误', false))
     }
-    loginFailures.delete(throttle.ip)
+    loginFailures.delete(throttle.key)
     if (params.decision !== 'allow') {
       res.writeHead(302, { location: redirectWith(params.redirect_uri, { error: 'access_denied', state: params.state }) })
       return res.end()
@@ -2296,7 +2336,7 @@ const server = http.createServer(async (req, res) => {
       return html(res, loginPage())
     }
     if (req.method === 'POST' && url.pathname === '/login') {
-      const throttle = loginThrottle(req)
+      const throttle = loginThrottle(req, 'login')
       if (throttle.blocked) {
         audit({ event: 'admin.login-blocked', ip: throttle.ip })
         res.writeHead(429, { 'content-type': 'text/html; charset=utf-8' })
@@ -2306,7 +2346,7 @@ const server = http.createServer(async (req, res) => {
       const passwordOk = passwordMatches(body.get('password'))
       const totpOk = config.profile?.totpEnabled !== true || verifyTotp(config.profile.totpSecret, body.get('code') ?? '')
       if (passwordOk && totpOk) {
-        loginFailures.delete(throttle.ip)
+        loginFailures.delete(throttle.key)
         res.writeHead(303, {
           location: '/',
           'set-cookie': adminCookie(createAdminSession(), req),
@@ -2314,11 +2354,11 @@ const server = http.createServer(async (req, res) => {
         return res.end()
       }
       if (passwordOk && !totpOk) {
-        recordLoginFailure(throttle.ip)
+        recordLoginFailure(throttle.key)
         audit({ event: 'admin.2fa-fail', ip: throttle.ip })
         return html(res, loginPage('两步验证码错误'))
       }
-      recordLoginFailure(throttle.ip)
+      recordLoginFailure(throttle.key)
       audit({ event: 'admin.login-fail', ip: throttle.ip })
       return html(res, loginPage('密码错误'))
     }
@@ -2392,14 +2432,17 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && url.pathname === '/api/agents') {
       const tokens = loadAgentTokens()
-      const agents = Object.entries(config.agents ?? {}).map(([name, token]) => ({
-        name,
-        alias: config.agentAliases?.[name] ?? '',
-        tokenPreview: tokens[name] ? maskToken(tokens[name]) : `sha256:${String(token).slice(7, 11)}…`,
-        allow: config.agentAccess?.[name] ?? [],
-        write: config.agentWrite?.[name] === true,
-        oauth: name.startsWith('oauth:') || token === 'oauth',
-      }))
+      const agents = Object.entries(config.agents ?? {}).map(([name, token]) => {
+        const oauth = name.startsWith('oauth:') || token === 'oauth'
+        return {
+          name,
+          alias: config.agentAliases?.[name] ?? '',
+          tokenPreview: oauth ? 'OAuth 2.1' : tokens[name] ? maskToken(tokens[name]) : `sha256:${String(token).slice(7, 11)}…`,
+          allow: config.agentAccess?.[name] ?? [],
+          write: config.agentWrite?.[name] === true,
+          oauth,
+        }
+      })
       const known = new Set(agents.map((agent) => agent.name))
       const oauthAgents = [...new Set(Object.values(config.oauthTokens ?? {}).map((token) => token.agent))]
         .filter((agent) => typeof agent === 'string' && agent.length > 0 && !known.has(agent))
@@ -2592,6 +2635,7 @@ const server = http.createServer(async (req, res) => {
         oidc: OIDC_ENABLED,
         ntfy: NTFY_URL.length > 0,
         publicUrl: PUBLIC_URL,
+        approvalTokens: (pruneApprovalTokens(), approvalTokens.size),
       })
     }
 
@@ -2948,6 +2992,7 @@ const server = http.createServer(async (req, res) => {
               const name = String(args.name ?? '').trim()
               if (!validName(name)) throw new Error('invalid item name')
               const entry = await createPending(agent, name, { reason: args.reason, command: args.command })
+              if (!entry) throw new Error('too many pending requests')
               return reply({ content: [{ type: 'text', text: `approval required: ${PUBLIC_URL}/ (request ${entry.id})` }] })
             }
             if (toolName === 'get_secret') {
@@ -3089,6 +3134,7 @@ const server = http.createServer(async (req, res) => {
           reason: url.searchParams.get('reason') ?? '',
           command: url.searchParams.get('command') ?? '',
         })
+        if (!entry) return json(res, 429, { error: 'too many pending requests' })
         return json(res, 202, { status: 'pending', requestId: entry.id, approveUrl: `${PUBLIC_URL}/` })
       }
     }

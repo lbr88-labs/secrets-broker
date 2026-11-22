@@ -79,9 +79,16 @@ model, or the stdio adapter's `exec_with_secrets`.
 
 The stdio adapter additionally provides `exec_with_secrets`, which injects
 secrets into a child process environment. The result masks the secret value and
-its base64, base64url and URL-encoded forms. The child environment does not
+its base64, base64url, URL-encoded and hex forms, including a value split across
+writes. The command is started by a parent process whose environment does not
 include `BROKER_AGENT_TOKEN`, `SECRETS_BROKER_TOKEN`, the Cloudflare Access
-service token, or the admin, master and encryption-key variables.
+service token, or the admin, master and encryption-key variables, so
+`/proc/$PPID/environ` does not contain them.
+
+Masking does not stop a command that wants the value. A prefix, a reversed or
+spaced string, or an encoding of the value with extra text is not removed. The
+helper process above that parent still has the original environment, and the
+token remains in the helper's memory and in the harness MCP config.
 
 Add the Access service token next to the agent token when the broker is behind
 Cloudflare Access:

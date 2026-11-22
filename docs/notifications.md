@@ -6,9 +6,16 @@ broker sends the same approval message to every configured channel.
 
 ## ntfy
 
-Set `NTFY_URL` to a **private** topic on a server you control, for example
+Set `NTFY_URL` to a topic on a server you control, for example
 `https://ntfy.example.com/secrets-broker`, and set `NTFY_TOKEN` to that topic's
-access token. The broker sends `Authorization: Bearer <token>`.
+access token. The broker sends `Authorization: Bearer <token>`. ACL the topic
+so only your user can read it and only this token can write it. The one-time
+approval tokens are stored in the ntfy `Actions` header, so a reader of the
+topic can approve until they expire (about 10 minutes).
+
+If the broker is behind Cloudflare Access, bypass Access for `POST /approve/*`
+only. The ntfy app runs that POST itself and does not send an Access cookie.
+Keep `GET /approve/*` and the rest of the hostname behind Access.
 
 The message body names the bot, the secret, the duration and the command, then
 a separate line for the bot-supplied reason (capped at 120 characters). It does

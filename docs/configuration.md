@@ -69,8 +69,8 @@ The OIDC section has a collapsible advanced panel:
 
 - Auto-unlock: `SECRETS_BROKER_MASTER_PASSWORD`. A `master-password` file is
   used only when the encryption key is not inside the data directory.
-- `autoImport` defaults to true (the original author's local credential import).
-  Set `"autoImport": false` in `config.json` before unlocking a shared vault.
+- `autoImport` defaults to false. Set `"autoImport": true` only if you still
+  want unlock to import the original author's local credential files.
 - Notifications: `NTFY_URL` and `NTFY_TOKEN`, `GOTIFY_URL`/`GOTIFY_TOKEN`,
   `WXPUSH_URL`/`WXPUSH_TOKEN`, `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` /
   `TELEGRAM_USER_ID`.

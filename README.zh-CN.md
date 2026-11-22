@@ -130,10 +130,9 @@ https://broker.example.com/mcp
 
 试点按这个用。OAuth 默认关闭，新安装不会创建 `dsh` / `codex` / `hermes`，空的 allow-list 表示没有任何权限。
 
-- 不配置 OIDC，不打开 OAuth（`SECRETS_BROKER_OAUTH` 不要设为 `1`）。`MCP_ALLOW_READ` 保持未设置。
+- 不配置 OIDC，不打开 OAuth（`SECRETS_BROKER_OAUTH` 不要设为 `1`）。`MCP_ALLOW_READ` 保持未设置。`autoImport` 默认是 false。
 - 不要把主密码文件和 `encryption.key` 放在同一个数据目录。密钥在数据目录里时，磁盘上的自动解锁会被拒绝。用 `SECRETS_BROKER_MASTER_PASSWORD`，或把密钥放到 `SECRETS_BROKER_ENCRYPTION_KEY` / `SECRETS_BROKER_KEY_FILE`。
-- 在 `config.json` 里设 `"autoImport": false`。
-- 公网主机名（含 `/approve/`）放在 Cloudflare Access 后面。每个 harness 单独的 Access service token，设 `CF_ACCESS_CLIENT_ID` 和 `CF_ACCESS_CLIENT_SECRET`，再加各自的 agent token。
+- 公网主机名放在 Cloudflare Access 后面，但只对 `POST /approve/*` 做 Access bypass。ntfy 按钮是手机直接 POST，不会带 Access cookie；这个 POST 仍要一次性 bearer token。`GET /approve/*` 和其他路径继续走 Access。每个 harness 单独的 Access service token，设 `CF_ACCESS_CLIENT_ID` 和 `CF_ACCESS_CLIENT_SECRET`，再加各自的 agent token。
 - 隧道打到本机时设 `SECRETS_BROKER_BEHIND_PROXY=1`。`BROKER_PUBLIC_URL` 不是本机地址时同样必须有管理密码。
 - ntfy 用自己的私有主题和 `NTFY_TOKEN`。Telegram 同时填 chat id 和 user id。
 - 每个 agent 都要有 allow-list。空列表不能读也不能写；`*` 才是全部条目。

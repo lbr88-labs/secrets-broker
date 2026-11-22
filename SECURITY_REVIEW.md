@@ -50,27 +50,27 @@ Status of every finding against the current tree. "Tested" means `npm test` (`te
 | C3 Missing admin password / `isLocal` | Fixed, tested. `isAdmin` is a server-side session only. A non-loopback bind, `SECRETS_BROKER_BEHIND_PROXY=1`, or a non-loopback `BROKER_PUBLIC_URL` refuses to start when no admin password is set. Loopback with no password still starts, and every admin route returns 401. |
 | H1 Read after revoke | Fixed, tested. A pending poll returns a value only while the grant is active, or for one `once` approval. Pending entries older than 10 minutes (`SECRETS_BROKER_PENDING_TTL_MS`) are deleted. |
 | H2 Read-limit races | Fixed, tested. Grant reads are reserved and saved before `bw` runs, and rolled back if the read fails. A `once` entry is consumed before the read. Parallel `maxReads=1` and `once` polls each return the secret exactly once. |
-| H3 TOTP-only approve | Fixed, tested. `/oauth/approve` requires the admin password and, when TOTP is on, a valid code. An admin cookie is not enough. Failures share the login throttle (5 failures, then 5 minutes). OAuth is off unless `SECRETS_BROKER_OAUTH=1` or `config.oauthEnabled`. |
+| H3 TOTP-only approve | Fixed, tested. `/oauth/approve` requires the admin password and, when TOTP is on, a valid code. An admin cookie is not enough. `/login` and `/oauth/approve` have separate lockouts (5 failures, then 5 minutes). OAuth is off unless `SECRETS_BROKER_OAUTH=1` or `config.oauthEnabled`. |
 | H4 OAuth reads everything | Fixed, tested. Dynamic registration is off unless OAuth is on, `SECRETS_BROKER_OAUTH_REGISTRATION=1` (or `config.oauthAllowRegistration`), and the caller is an admin. New OAuth agents start with an empty allow-list. Deleting `oauth:<clientId>` revokes the client and its tokens. |
-| H5 exec output and token leak | Fixed, tested. `exec_with_secrets` and `wh.mjs run` replace the raw value, base64, base64url and URL-encoding with `[redacted]`, and the child does not receive the agent token, the Cloudflare Access token, or the admin/master/encryption secrets. |
+| H5 exec output and token leak | Fixed for the original leak, with limits. Raw, base64, base64url, URL-encoding and hex are masked, including across `wh.mjs` chunk boundaries. The command's parent is started without the agent token, so `/proc/$PPID/environ` does not contain it. A prefix, reversed text, or the helper's own environment can still expose the value. |
 | H6 Allow-all and default agents | Fixed, tested. An empty or missing allow-list matches nothing. `*` is the explicit allow-all pattern. A new install creates no agents. Existing `config.agents` entries are left in place. |
-| H7 ntfy capability links | Fixed, tested. The ntfy body has no `/approve/` URL. Allow/deny are `http` POST actions with a one-time bearer token (`NTFY_TOKEN` or the encrypted settings token is sent as `Authorization: Bearer`). `GET /approve/:id` only shows a confirm form. The push separates bot, secret, duration and command from a 120-character untrusted reason. A private topic is a deployment choice; see the README. |
+| H7 ntfy capability links | Fixed, tested. The ntfy body has no `/approve/` URL. Allow/deny are `http` POST actions with a one-time bearer token (`NTFY_TOKEN` or the encrypted settings token is sent as `Authorization: Bearer`). `GET /approve/:id` only shows a confirm form. Bot, secret and duration stay above the untrusted label; the reason and command sit under it. A private topic plus an Access bypass for `POST /approve/*` is a deployment choice; see the README. |
 | M1 Write outside the allow-list | Fixed, tested. Creates and overwrites both require the name to match the allow-list. |
 | M2 Admin session | Fixed, tested. Each login gets a random in-memory id (default TTL 12h, `SECRETS_BROKER_ADMIN_SESSION_TTL_MS`). Logout deletes that id. The cookie is `HttpOnly` and `SameSite=Strict`. `Secure` is set when `BROKER_PUBLIC_URL` is `https`, `x-forwarded-proto` is `https`, the socket is TLS, or `SECRETS_BROKER_COOKIE_SECURE=1`. Plain `http://127.0.0.1` omits `Secure` so a browser can store the cookie; `SECRETS_BROKER_COOKIE_SECURE=0` forces it off. Password comparison hashes both sides before `timingSafeEqual`. |
 | M3 Files and the encryption key | Fixed, tested. The data directory is `0700` and config, grants, audit, agent tokens and the key file are `0600`. The TOTP secret and the ntfy token are encrypted in `config.json`. If `encryption.key` is inside the data directory, the on-disk `master-password` file is not used. `SECRETS_BROKER_MASTER_PASSWORD`, or a key from `SECRETS_BROKER_ENCRYPTION_KEY` / `SECRETS_BROKER_KEY_FILE` outside the data directory, still unlocks. The admin token-reveal API is unchanged. |
-| M4 Prompt content | Partial. Trusted fields are separate from the clipped reason, and bidi/zero-width characters are stripped. Not fixed: an agent can still flood distinct names, including names that are not in the vault. |
+| M4 Prompt content | Partial. Trusted fields are separate from the clipped reason and the bot-supplied command, and bidi/zero-width characters are stripped. Each bot can have at most 5 pending requests. Names that are not in the vault can still be requested, up to that cap. |
 | M5 Whole-vault decrypt | Not fixed. Every read still runs `bw list items`. |
 | M6 Container | Partial. The Dockerfile uses `USER node` and pins `node:24-bookworm-slim` by digest. Both compose files publish `127.0.0.1:8788:8788`. The container still binds `0.0.0.0` so that publish works. Not run as a container in this environment. `@bitwarden/cli` advisories (multer, node-forge, tmp) are unchanged; the broker does not use `bw serve`. |
 | M7 Restore makes a grant permanent | Fixed, tested. Restore clears `revokedAt` and resets `reads`, and leaves `expiresAt` as it was. An expired grant stays inactive until an admin sets a new expiry. |
 | Low: loose URL match | Not fixed. `url=com` can still match `*.com`, subject to the allow-list and an active grant. |
-| Low: auto-import | Not changed. `autoImport` still defaults to true. Set `autoImport: false` in `config.json` for this deployment. |
+| Low: auto-import | Fixed. `autoImport` defaults to false. A config that already sets `true` still imports. |
 | Low: error leakage | Not fixed. `bw` stderr still reaches the admin UI, and an OIDC token error snippet can still appear on the login page. |
 | Low: unbounded maps | Not fixed, except that pending requests older than the pending TTL are removed. `oauthCodes` and `loginFailures` are still in-memory maps with no cap. |
 | Low: audit has no client IP | Not fixed. Secret values are still not written to the audit log. |
 | Low: adapters and Cloudflare Access | Fixed, tested. `mcp-server.mjs` and `wh.mjs` send `CF-Access-Client-Id` and `CF-Access-Client-Secret` when both env vars are set. They no longer treat a stored `sha256:` hash as a bearer token and no longer default the agent name to `dsh`. |
 | Low: HTTP MCP protocol, dead dashboard, licence string | Not changed. HTTP `/mcp` is still plain JSON `2024-11-05`. `dashboardShell` is still unused. `package.json` still says MIT while `LICENSE` says AGPL-3.0. |
 
-The login throttle is still keyed by the connecting IP. Behind one tunnel address, failed attempts can lock the owner out for five minutes. That was called out in H3 and is unchanged.
+`/login` and `/oauth/approve` use separate lockout buckets, both still keyed by the connecting IP. Behind one tunnel address, failed attempts can lock that one form for five minutes.
 
 Our own deployment choices also need to change for the pilot:
 - Use ntfy on a self-hosted, ACL-protected topic, or Telegram only after fix 1.
@@ -78,7 +78,7 @@ Our own deployment choices also need to change for the pilot:
 - Keep `MCP_ALLOW_READ` unset.
 - Set `autoImport=false`.
 - Use a Cloudflare Access service token per harness in addition to the agent token.
-- Keep `/approve/*` behind Access too, so the phone must pass Access.
+- Bypass Access for `POST /approve/*` only, so ntfy buttons still work. Keep `GET /approve/*` and every other path behind Access. Use a private self-hosted ntfy topic with an ACL.
 
 ---
 
@@ -139,7 +139,7 @@ A tricked agent that has kept its request ID keeps access until the broker resta
 
 ### H3. `/oauth/approve` accepts TOTP alone and has no rate limit (High)
 
-**Status:** Fixed, tested. The notes below describe commit `366e4dd`. The shared per-IP lockout can still lock the owner out behind one tunnel address.
+**Status:** Fixed, tested. The notes below describe commit `366e4dd`. `/login` and `/oauth/approve` now have separate per-IP lockouts. A shared tunnel address can still lock one of those forms.
 
 `server.mjs:1931-1938`: authorization is granted if the request has an admin cookie, **or** the password matches, **or** a valid TOTP code is given (6 digits, ±1 window, `:1660-1667`). TOTP alone is a single 6-digit factor with about 3 valid codes at any moment. Neither branch goes through `loginThrottle`.
 
@@ -157,7 +157,7 @@ A tricked agent that has kept its request ID keeps access until the broker resta
 
 ### H5. `exec_with_secrets` doesn't mask output and passes the agent token to the child (High)
 
-**Status:** Fixed, tested. The notes below describe commit `366e4dd`. HTTP `get_secret` still returns plaintext when `MCP_ALLOW_READ=1`.
+**Status:** Fixed for the original leak, with the limits in the remediation table. The notes below describe commit `366e4dd`. HTTP `get_secret` still returns plaintext when `MCP_ALLOW_READ=1`.
 
 - `mcp-server.mjs:142-157`: the secret is injected into the child env, and the child's raw stdout and stderr are returned to the model. Nothing is masked.
 - The child also inherits the whole `process.env`, including `BROKER_AGENT_TOKEN`. The same applies to `wh.mjs:107` (`SECRETS_BROKER_TOKEN`).
@@ -212,7 +212,7 @@ Impact: a write-enabled agent could swap another service's credential or URL, fo
 
 ### M4. Approval prompt shows an agent-controlled string and no context (Medium)
 
-**Status:** Partial. Trusted fields are separated and bot text is capped. Flooding distinct names is not fixed. The notes below describe commit `366e4dd`.
+**Status:** Partial. Trusted fields are separated from the reason and the command, bot text is capped, and each bot is limited to 5 pending requests. The notes below describe commit `366e4dd`.
 
 - The push shows the agent name (trusted, derived from the token) and the item name, which is **agent-supplied**.
 - `validName` (`:293-302`) blocks control characters and a leading `-`, but allows 160 characters of anything else: Unicode bidi overrides (verified: `U+202E` passes), spaces, and URLs.
@@ -247,7 +247,7 @@ Impact: a write-enabled agent could swap another service's credential or URL, fo
 
 ### Low / informational
 
-**Status:** Cloudflare Access headers and the broken sha256 token fallback are fixed and tested. The other items in this list are not fixed. See the remediation table.
+**Status:** Cloudflare Access headers, the sha256 token fallback, and the `autoImport` default are fixed. See the remediation table for what is still open. `autoImport` defaults to false.
 
 - **Loose URL matching** (`:450-457`): `/secret?url=com` matches any `*.com` item. **Verified:** `url=com` matched `aws.amazon.com`. It is still subject to the allowlist and grants.
 - **Auto-import writes to the vault** (`:514-559`, run on every unlock `:353`): it reads `~/.dsh-home/.env`, `.credentials.yaml` and `mcp-auth/mcp-token.json` and creates vault items. This is specific to the author's setup; set `autoImport: false`.

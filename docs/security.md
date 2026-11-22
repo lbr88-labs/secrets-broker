@@ -58,11 +58,15 @@ See the README section **Secure deployment**. In short:
 - Publish `127.0.0.1:8788` only, or reach the broker through a tunnel. Set
   `SECRETS_BROKER_BEHIND_PROXY=1` when the tunnel arrives on localhost.
 - Set a strong `SECRETS_BROKER_ADMIN_PASSWORD`. Leave OIDC and OAuth off.
-- Leave `MCP_ALLOW_READ` unset. Set `autoImport` to `false`.
+- Leave `MCP_ALLOW_READ` unset. `autoImport` defaults to false.
 - Put the encryption key outside the data volume. Do not enable on-disk
   auto-unlock.
-- One Cloudflare Access service token per harness, and keep `/approve/` behind
-  Access. Use a private ntfy topic with `NTFY_TOKEN`.
+- One Cloudflare Access service token per harness. Bypass Access for
+  `POST /approve/*` only (ntfy buttons cannot send an Access cookie). Keep
+  `GET /approve/*` and every other path behind Access.
+- Self-host ntfy. ACL the topic so only your user can read it and only the
+  broker token can write it. Set `NTFY_TOKEN`. The action tokens are visible to
+  anyone who can read the topic.
 - Give each agent an allow-list. An empty list grants nothing.
 - The container runs as uid 1000. `chown 1000:1000` the data directory if it
   was created as root.

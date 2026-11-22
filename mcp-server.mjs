@@ -18,8 +18,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { spawn } from 'node:child_process'
-import { accessHeaders, childEnv, redactSecrets } from './redact.mjs'
+import { accessHeaders, childEnv, redactSecrets, spawnUserCommand } from './redact.mjs'
 
 const BROKER_URL = (process.env.BROKER_URL ?? 'http://127.0.0.1:8788').replace(/\/+$/, '')
 const CONFIG_PATH = process.env.BROKER_CONFIG ?? path.join(os.homedir(), '.secrets-broker', 'config.json')
@@ -147,10 +146,7 @@ async function callTool(name, args = {}) {
       injected[envName] = (await readSecret(itemName)).value
     }
     const secrets = Object.values(injected)
-    const child = spawn(args.command, args.args ?? [], {
-      env: childEnv(process.env, injected),
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
+    const child = spawnUserCommand(args.command, args.args ?? [], childEnv(process.env, injected), { stdin: 'ignore' })
     let stdout = ''
     let stderr = ''
     child.stdout.on('data', (chunk) => { stdout += chunk })

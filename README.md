@@ -184,10 +184,19 @@ Tools: `list_secrets`, `create_secret`, `request_access`, and optional `get_secr
 ```
 
 The stdio adapter adds `exec_with_secrets`, which injects secrets into a local child
-process environment. Returned stdout and stderr have the secret and its base64 and
-URL-encoded forms replaced with `[redacted]`. The child does not receive
-`BROKER_AGENT_TOKEN`. Set `BROKER_AGENT_TOKEN` explicitly; a stored `sha256:` hash
-is not used as a bearer token.
+process environment. Returned stdout and stderr have the secret and its base64,
+base64url, URL-encoded and hex forms replaced with `[redacted]`, including when
+the value is split across writes. `wh.mjs` does the same. The command's parent
+process is started without `BROKER_AGENT_TOKEN`, `SECRETS_BROKER_TOKEN`, the
+Cloudflare Access service token, or the admin, master and encryption-key
+variables, so `/proc/$PPID/environ` does not contain them.
+
+That masking is a guard against accidents. A command can still print a prefix,
+a reversed or spaced value, or an encoding of the value plus extra text. The
+helper that launched the parent still has the original environment, and the
+token is also in the harness MCP config and in the helper's memory. Set
+`BROKER_AGENT_TOKEN` explicitly; a stored `sha256:` hash is not used as a bearer
+token.
 
 ## Notifications
 
@@ -209,21 +218,29 @@ install creates no agents, and an empty allow-list matches nothing.
   unless OAuth is on, `SECRETS_BROKER_OAUTH_REGISTRATION=1`, and the request
   carries an admin session cookie.
 - Leave `MCP_ALLOW_READ` unset. `get_secret` returns the value to the model.
-- Do not enable on-disk auto-unlock. Set `autoImport` to `false` in
-  `config.json` so unlock does not write the author's local credential files
-  into the vault.
-- Put Cloudflare Access in front of the public hostname, including `/approve/`.
-  Give each harness its own Access service token and set
-  `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET` on `mcp-server.mjs` and
-  `wh.mjs`. Those two headers are added only when both variables are set.
-  Keep a separate agent token per harness as well.
+- Do not enable on-disk auto-unlock. `autoImport` now defaults to false, so
+  unlock does not write the author's local credential files into the vault.
+  An existing config that sets `"autoImport": true` still imports.
+- Put Cloudflare Access in front of the public hostname. Give each harness its
+  own Access service token and set `CF_ACCESS_CLIENT_ID` and
+  `CF_ACCESS_CLIENT_SECRET` on `mcp-server.mjs` and `wh.mjs`. Those two headers
+  are added only when both variables are set. Keep a separate agent token per
+  harness as well.
+- Bypass Access for `POST /approve/*` only. ntfy action buttons are HTTP POSTs
+  from the ntfy app and do not send an Access cookie or service token. The POST
+  is still gated by a one-time bearer token. Keep `GET /approve/*` and every
+  other path behind Access. Do not put the whole `/approve/` prefix behind
+  Access, or the phone buttons stop working.
 - If a tunnel reaches a process that is bound to `127.0.0.1`, set
   `SECRETS_BROKER_BEHIND_PROXY=1`. A non-loopback `BROKER_PUBLIC_URL` is treated
   the same way. Either one, or a non-loopback bind, refuses to start unless
   `SECRETS_BROKER_ADMIN_PASSWORD` is set.
-- Run ntfy yourself, on a private topic, and set `NTFY_TOKEN` (or the token
-  field in Settings). Approvals are ntfy `http` action buttons: `POST` with a
-  one-time bearer token. The message body does not contain an `/approve/` URL.
+- Run ntfy yourself. ACL the topic so only your user can read it and only the
+  broker's token can write it, and set `NTFY_TOKEN` (or the token field in
+  Settings). The one-time approval tokens sit in the ntfy `Actions` header, so
+  anyone who can read the topic can approve for about 10 minutes. Approvals are
+  `http` POST buttons. The message body does not contain an `/approve/` URL.
+  The bot-supplied reason and command are below an untrusted-text label.
   Opening the signed link in a browser shows a confirm form; the decision is a
   `POST`. Configure Telegram with both `TELEGRAM_CHAT_ID` and
   `TELEGRAM_USER_ID`. Incoming messages never change those ids.
@@ -234,9 +251,9 @@ The admin cookie is `HttpOnly` and `SameSite=Strict`, one random id per login,
 and it is deleted on logout. `Secure` is added when `BROKER_PUBLIC_URL` is
 `https://` (or the request is HTTPS). On plain `http://127.0.0.1` it is omitted
 so a browser can keep the session; set `SECRETS_BROKER_COOKIE_SECURE=1` to force
-it. Login and `/oauth/approve` share a per-IP lockout (5 failures, then 5
-minutes), so a tunnel that shows every client as one address can lock the
-owner out.
+it. `/login` and `/oauth/approve` have separate per-IP lockouts (5 failures, then
+5 minutes). A tunnel that shows every client as one address can still lock that
+one form. A bot can have at most 5 pending approval requests at a time.
 
 Default listen address outside Docker is `127.0.0.1`. The image listens on
 `0.0.0.0` and Compose publishes `127.0.0.1:8788:8788`.

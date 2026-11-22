@@ -18,12 +18,19 @@ Keep the encryption key out of `./data`. Set `SECRETS_BROKER_ENCRYPTION_KEY` or
 `encryption.key` sits in the data directory.
 
 Expose the broker only through a private network or a tunnel (Cloudflare Tunnel,
-Tailscale, WireGuard). Put Cloudflare Access in front of the hostname, including
-`/approve/`. Give each harness its own Access service token
-(`CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` on the stdio adapter) plus
-its own agent token. Leave OIDC, OAuth and `MCP_ALLOW_READ` off. Set
-`SECRETS_BROKER_BEHIND_PROXY=1` when the tunnel connects to loopback; a
-non-loopback `BROKER_PUBLIC_URL` already requires an admin password.
+Tailscale, WireGuard). Put Cloudflare Access in front of the hostname, with a
+bypass for `POST /approve/*` only. ntfy action buttons are POSTs from the ntfy
+app and do not send an Access cookie; the one-time bearer token still gates
+them. Keep `GET /approve/*` and every other path behind Access. Give each
+harness its own Access service token (`CF_ACCESS_CLIENT_ID` /
+`CF_ACCESS_CLIENT_SECRET` on the stdio adapter) plus its own agent token. Leave
+OIDC, OAuth and `MCP_ALLOW_READ` off. Set `SECRETS_BROKER_BEHIND_PROXY=1` when
+the tunnel connects to loopback; a non-loopback `BROKER_PUBLIC_URL` already
+requires an admin password.
+
+For ntfy, run your own server and ACL the topic: read for your user only, write
+for the broker's `NTFY_TOKEN`. Anyone who can read the topic can see the
+one-time approval tokens.
 
 ## Synology / NAS
 

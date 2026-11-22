@@ -8,7 +8,7 @@ import path from 'node:path'
 import http from 'node:http'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { redactSecrets } from '../redact.mjs'
+import { createRedactor, redactSecrets } from '../redact.mjs'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const SERVER = path.join(ROOT, 'server.mjs')
@@ -138,6 +138,7 @@ async function startBroker(extra = {}, { config, files = {}, masterPassword = 'v
     base,
     child,
     logs: () => logs,
+    env,
     ready,
     async stop() {
       if (child.exitCode === null) {
@@ -264,6 +265,7 @@ test('fresh install creates no default agents and private data files', async () 
     assert.equal(config.agents?.dsh, undefined)
     assert.equal(config.agents?.codex, undefined)
     assert.equal(config.agents?.hermes, undefined)
+    assert.equal(config.autoImport, false)
     const dir = await stat(broker.home)
     const file = await stat(path.join(broker.home, 'config.json'))
     assert.equal(modeOf(dir), 0o700)
@@ -600,6 +602,8 @@ test('oauth stays off by default and TOTP alone cannot mint a code', async () =>
       if (response.status === 429) sawThrottle = true
     }
     assert.equal(sawThrottle, true)
+    const afterOauthLock = await login(opened.base, 'test-admin-password', totpCode(TOTP_SECRET))
+    assert.equal(afterOauthLock.response.status, 303)
     const removed = await adminPost(opened.base, session.cookie, '/api/agents/delete', { name: agentName })
     assert.equal(removed.status, 200, JSON.stringify(removed.payload))
     const revoked = await fetch(`${opened.base}/agent/items`, { headers: { authorization: `Bearer ${token}` } })
@@ -792,7 +796,10 @@ test('ntfy uses a private token, action buttons, and a POST confirm step', async
     assert.equal(note.body.includes('https://evil.example/phish'), false)
     assert.match(note.body, /bot/i)
     assert.match(note.body, /gatewayapi/)
-    assert.match(note.body, /printenv AWS/)
+    const untrustedAt = note.body.search(/Untrusted text from the bot/i)
+    assert.ok(untrustedAt > 0, note.body)
+    assert.equal(note.body.slice(0, untrustedAt).includes('printenv AWS'), false, note.body)
+    assert.equal(note.body.slice(untrustedAt).includes('printenv AWS'), true, note.body)
     assert.match(note.body, /untrusted|未验证|reason/i)
     const actions = JSON.parse(note.headers.actions ?? note.headers['x-actions'] ?? '[]')
     assert.ok(actions.length >= 1)
@@ -992,7 +999,7 @@ test('exec_with_secrets and wh.mjs mask output and drop the agent token', async 
       allow: 'gatewayapi',
       grant: { item: 'gatewayapi', ttlHours: 1, maxReads: 5 },
     })
-    const script = `const v=process.env.X||''; process.stdout.write('VAL='+v+'\\n'); process.stdout.write('B64='+Buffer.from(v).toString('base64')+'\\n'); process.stdout.write('URL='+encodeURIComponent(v)+'\\n'); process.stdout.write('TOK='+(process.env.BROKER_AGENT_TOKEN||'')+'\\n'); process.stdout.write('STOK='+(process.env.SECRETS_BROKER_TOKEN||'')+'\\n');`
+    const script = `const fs=require('fs'); const v=process.env.X||''; const parent=fs.readFileSync('/proc/'+process.ppid+'/environ').toString('utf8'); const keys=parent.split('\\0').map(p=>p.split('=')[0]); process.stdout.write('VAL='+v+'\\n'); process.stdout.write('B64='+Buffer.from(v).toString('base64')+'\\n'); process.stdout.write('URL='+encodeURIComponent(v)+'\\n'); process.stdout.write('HEX='+Buffer.from(v).toString('hex')+'\\n'); process.stdout.write('TOK='+(process.env.BROKER_AGENT_TOKEN||'')+'\\n'); process.stdout.write('STOK='+(process.env.SECRETS_BROKER_TOKEN||'')+'\\n'); process.stdout.write('PPID_KEYS='+['BROKER_AGENT_TOKEN','SECRETS_BROKER_TOKEN','CF_ACCESS_CLIENT_SECRET','SECRETS_BROKER_ADMIN_PASSWORD'].filter(k=>keys.includes(k)).join(',')+'\\n');`
     const mcp = spawn(process.execPath, [path.join(ROOT, 'mcp-server.mjs')], {
       env: {
         ...process.env,
@@ -1021,6 +1028,8 @@ test('exec_with_secrets and wh.mjs mask output and drop the agent token', async 
     assert.equal(text.includes('GW-SECRET-1234'), false, text)
     assert.equal(text.includes(Buffer.from('GW-SECRET-1234').toString('base64')), false, text)
     assert.equal(text.includes(encodeURIComponent('GW-SECRET-1234')), false, text)
+    assert.equal(text.includes(Buffer.from('GW-SECRET-1234').toString('hex')), false, text)
+    assert.match(text, /PPID_KEYS=\s/)
     assert.equal(text.includes(agent.token), false, text)
     assert.equal(text.includes('should-not-leak'), false, text)
     assert.match(text, /\[redacted\]/)
@@ -1041,8 +1050,29 @@ test('exec_with_secrets and wh.mjs mask output and drop the agent token', async 
     assert.equal(helperCode, 0, helperOut)
     assert.equal(helperOut.includes('GW-SECRET-1234'), false, helperOut)
     assert.equal(helperOut.includes(Buffer.from('GW-SECRET-1234').toString('base64')), false, helperOut)
+    assert.equal(helperOut.includes(Buffer.from('GW-SECRET-1234').toString('hex')), false, helperOut)
+    assert.match(helperOut, /PPID_KEYS=\s/)
     assert.equal(helperOut.includes(agent.token), false, helperOut)
     assert.equal(helperOut.includes('parent-token'), false, helperOut)
+
+    const splitScript = `const v=process.env.X||''; process.stdout.write(v.slice(0,4)); setTimeout(()=>process.stdout.write(v.slice(4)), 300)`
+    const splitter = spawn(process.execPath, [path.join(ROOT, 'wh.mjs'), 'run', '--var', 'X=gatewayapi', '--', process.execPath, '-e', splitScript], {
+      env: {
+        ...process.env,
+        SECRETS_BROKER_URL: broker.base,
+        SECRETS_BROKER_TOKEN: agent.token,
+        BROKER_AGENT_TOKEN: 'parent-token',
+      },
+    })
+    let splitOut = ''
+    splitter.stdout.on('data', (chunk) => {
+      splitOut += chunk
+    })
+    const splitCode = await new Promise((resolve) => splitter.once('exit', resolve))
+    assert.equal(splitCode, 0, splitOut)
+    assert.equal(splitOut.includes('GW-SECRET-1234'), false, splitOut)
+    assert.equal(splitOut.includes('GW-SE'), false, splitOut)
+    assert.equal(splitOut.includes('CRET-1234'), false, splitOut)
   } finally {
     await broker.stop()
   }
@@ -1104,6 +1134,214 @@ test('restore does not turn an expired grant into a permanent one', async () => 
   } finally {
     await broker.stop()
   }
+})
+
+test('the literal bearer token oauth does not authenticate an oauth agent', async () => {
+  const placeholderHash = `sha256:${crypto.createHash('sha256').update('oauth').digest('hex')}`
+  const broker = await startBroker(
+    {},
+    {
+      config: {
+        port: 8788,
+        serverUrl: 'https://vault.example.com',
+        bwJs: FAKE_BW,
+        autoImport: false,
+        agents: {
+          'oauth:plain': 'oauth',
+          'oauth:hashed': placeholderHash,
+          keeper: 'keeper-token-value',
+        },
+        agentAccess: {
+          'oauth:plain': ['gatewayapi'],
+          'oauth:hashed': ['gatewayapi'],
+          keeper: ['gatewayapi'],
+        },
+        oauthClients: {
+          plain: { clientId: 'plain', redirectUris: ['https://app.example/cb'], revoked: false },
+          hashed: { clientId: 'hashed', redirectUris: ['https://app.example/cb'], revoked: false },
+        },
+      },
+    },
+  )
+  const children = [broker.child]
+  try {
+    await broker.ready
+    const saved = JSON.parse(await readFile(path.join(broker.home, 'config.json'), 'utf8'))
+    assert.equal(saved.agents['oauth:plain'], null)
+    assert.equal(saved.agents['oauth:hashed'], null)
+    assert.equal(JSON.stringify(saved.agents).includes(placeholderHash), false)
+    let keeper
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      keeper = await fetch(`${broker.base}/secret?name=gatewayapi`, {
+        headers: { authorization: 'Bearer keeper-token-value' },
+      })
+      if (keeper.status !== 503) break
+      await sleep(50)
+    }
+    assert.equal(keeper.status, 202)
+    const stolen = await fetch(`${broker.base}/agent/items`, { headers: { authorization: 'Bearer oauth' } })
+    assert.equal(stolen.status, 401)
+    const stolenSecret = await fetch(`${broker.base}/secret?name=gatewayapi`, { headers: { authorization: 'Bearer oauth' } })
+    assert.equal(stolenSecret.status, 401)
+
+    broker.child.kill('SIGTERM')
+    await new Promise((resolve) => broker.child.once('exit', resolve))
+    const port = await freePort()
+    const relaunched = spawn(process.execPath, [SERVER], {
+      cwd: ROOT,
+      env: { ...broker.env, SECRETS_BROKER_PORT: String(port), BROKER_PUBLIC_URL: `http://127.0.0.1:${port}`, SECRETS_BROKER_OAUTH: '0' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    children.push(relaunched)
+    let logs = ''
+    relaunched.stdout.on('data', (chunk) => {
+      logs += chunk
+    })
+    relaunched.stderr.on('data', (chunk) => {
+      logs += chunk
+    })
+    const deadline = Date.now() + 8000
+    while (Date.now() < deadline && !logs.includes('listening')) {
+      if (relaunched.exitCode !== null) throw new Error(logs)
+      await sleep(30)
+    }
+    const again = await fetch(`http://127.0.0.1:${port}/agent/items`, { headers: { authorization: 'Bearer oauth' } })
+    assert.equal(again.status, 401)
+    let keeperAgain
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      keeperAgain = await fetch(`http://127.0.0.1:${port}/secret?name=gatewayapi`, {
+        headers: { authorization: 'Bearer keeper-token-value' },
+      })
+      if (keeperAgain.status !== 503) break
+      await sleep(50)
+    }
+    assert.equal(keeperAgain.status, 202)
+    relaunched.kill('SIGTERM')
+  } finally {
+    for (const child of children) {
+      if (child.exitCode === null) child.kill('SIGKILL')
+    }
+    await broker.stop()
+  }
+})
+
+test('login lockout does not block oauth approval', async () => {
+  const broker = await startBroker({ SECRETS_BROKER_OAUTH: '1' })
+  try {
+    await broker.ready
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const response = await fetch(`${broker.base}/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ password: 'wrong-password' }),
+        redirect: 'manual',
+      })
+      if (attempt < 5) assert.notEqual(response.status, 429)
+      else assert.equal(response.status, 429)
+    }
+    const approve = await fetch(`${broker.base}/oauth/approve`, {
+      method: 'POST',
+      redirect: 'manual',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: 'missing',
+        redirect_uri: 'https://app.example/cb',
+        password: 'wrong-password',
+        decision: 'allow',
+      }),
+    })
+    assert.notEqual(approve.status, 429)
+    const text = await approve.text()
+    assert.equal(text.includes('code='), false)
+  } finally {
+    await broker.stop()
+  }
+})
+
+test('a bot cannot keep more than five pending requests', async () => {
+  const broker = await startBroker()
+  try {
+    const agent = await provisionAgent(broker, { allow: '*' })
+    const statuses = []
+    for (let index = 1; index <= 6; index += 1) {
+      const response = await fetch(`${broker.base}/secret?name=flood-${index}`, {
+        headers: { authorization: `Bearer ${agent.token}` },
+      })
+      statuses.push(response.status)
+    }
+    assert.deepEqual(statuses, [202, 202, 202, 202, 202, 429])
+    const again = await fetch(`${broker.base}/secret?name=flood-1`, {
+      headers: { authorization: `Bearer ${agent.token}` },
+    })
+    assert.equal(again.status, 202)
+    const pending = await fetch(`${broker.base}/api/pending`, { headers: { cookie: agent.cookie } })
+    const rows = (await pending.json()).requests.filter((entry) => entry.agent === 'bot')
+    assert.equal(rows.length, 5)
+  } finally {
+    await broker.stop()
+  }
+})
+
+test('expired one-time approval tokens are dropped', async () => {
+  const ntfy = await listen((req, res) => {
+    let body = ''
+    req.on('data', (chunk) => {
+      body += chunk
+    })
+    req.on('end', () => {
+      ntfy.requests.push({ headers: req.headers, body })
+      res.writeHead(200)
+      res.end('ok')
+    })
+  })
+  ntfy.requests = []
+  const broker = await startBroker({
+    NTFY_URL: `${ntfy.base}/secrets`,
+    NTFY_TOKEN: 'ntfy-private-token',
+    SECRETS_BROKER_APPROVAL_TOKEN_TTL_MS: '1500',
+  })
+  try {
+    const agent = await provisionAgent(broker, { allow: 'gatewayapi' })
+    const pending = await fetch(`${broker.base}/secret?name=gatewayapi`, {
+      headers: { authorization: `Bearer ${agent.token}` },
+    })
+    assert.equal(pending.status, 202)
+    await waitFor(() => ntfy.requests.length > 0)
+    const actions = JSON.parse(ntfy.requests[0].headers.actions ?? '[]')
+    const once = actions.find((action) => /once/i.test(action.label))
+    const token = String(once.headers?.Authorization ?? once.headers?.authorization ?? '').replace(/^Bearer /, '')
+    const before = await fetch(`${broker.base}/api/status`, { headers: { cookie: agent.cookie } })
+    assert.equal((await before.json()).approvalTokens, 4)
+    await sleep(1700)
+    const after = await fetch(`${broker.base}/api/status`, { headers: { cookie: agent.cookie } })
+    assert.equal((await after.json()).approvalTokens, 0)
+    const late = await fetch(once.url, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/x-www-form-urlencoded' },
+      body: 'decision=once',
+    })
+    const lateText = await late.text()
+    assert.equal(lateText.includes('已选择'), false)
+  } finally {
+    await broker.stop()
+    await ntfy.close()
+  }
+})
+
+test('redactor holds a secret split across chunks and masks hex', () => {
+  const secret = 'GW-SECRET-1234'
+  const redactor = createRedactor([secret])
+  let out = ''
+  for (const char of secret) out += redactor.push(char)
+  out += redactor.flush()
+  assert.equal(out.includes(secret), false, out)
+  assert.match(out, /\[redacted\]/)
+  const hex = Buffer.from(secret).toString('hex')
+  const hexRedactor = createRedactor([secret])
+  let hexOut = hexRedactor.push(hex.slice(0, 10))
+  hexOut += hexRedactor.push(hex.slice(10))
+  hexOut += hexRedactor.flush()
+  assert.equal(hexOut.toLowerCase().includes(hex), false, hexOut)
 })
 
 test('dockerfile runs as non-root and compose publishes loopback only', async () => {
